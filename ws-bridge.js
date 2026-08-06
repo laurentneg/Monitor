@@ -10,6 +10,8 @@ const DEFAULT_CONFIG = {
     tetrapolBase: 'http://127.0.0.1:8080',
     icecastPublicBase: '',
     broadcastIntervalMs: 250,
+    /** Full snapshot resync to clients (patches in between). */
+    fullSyncIntervalMs: 30000,
     /** Mark Airband/Tetrapol dead if no WS update arrives within this window. */
     sourceStaleMs: 5000,
     pulseArbiter: true,
@@ -45,6 +47,14 @@ function deepMerge(target, source) {
     return target;
 }
 
+function cloneJson(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function stableStringify(value) {
+    return JSON.stringify(value);
+}
+
 function parseUpdateMessage(raw) {
     try {
         const msg = JSON.parse(raw);
@@ -72,6 +82,234 @@ function pulseModePayload(pe) {
     };
 }
 
+function listFromSection(section, arrayKey) {
+    if (!section) return [];
+    if (Array.isArray(section)) return section;
+    if (arrayKey && Array.isArray(section[arrayKey])) return section[arrayKey];
+    return [];
+}
+
+function entityId(item, keys) {
+    if (!item || typeof item !== 'object') return null;
+    for (const key of keys) {
+        if (item[key] != null && item[key] !== '') return String(item[key]);
+    }
+    return null;
+}
+
+/** Diff two entity lists; return { upsert, remove } or null if unchanged. */
+function diffEntityList(currList, prevList, idKeys) {
+    const currMap = new Map();
+    const prevMap = new Map();
+    for (const item of currList || []) {
+        const id = entityId(item, idKeys);
+        if (id != null) currMap.set(id, item);
+    }
+    for (const item of prevList || []) {
+        const id = entityId(item, idKeys);
+        if (id != null) prevMap.set(id, item);
+    }
+    const upsert = [];
+    const remove = [];
+    for (const [id, item] of currMap) {
+        const prev = prevMap.get(id);
+        if (!prev || stableStringify(prev) !== stableStringify(item)) {
+            upsert.push(item);
+        }
+    }
+    for (const id of prevMap.keys()) {
+        if (!currMap.has(id)) remove.push(id);
+    }
+    if (!upsert.length && !remove.length) return null;
+    const out = {};
+    if (upsert.length) out.upsert = upsert;
+    if (remove.length) out.remove = remove;
+    return out;
+}
+
+function diffPlainObject(curr, prev) {
+    if (stableStringify(curr) === stableStringify(prev)) return null;
+    return cloneJson(curr);
+}
+
+/** Quantize noisy pulse telemetry so tiny fill/buffer jitter does not emit patches. */
+function normalizePulseExclusive(pe) {
+    if (!pe || typeof pe !== 'object') return pe || {};
+    const out = { ...pe };
+    const qFill = (v) => Math.floor((Number(v) || 0) * 100) / 100; // 1% floor buckets
+    const qBuf = (v) => Math.floor((Number(v) || 0) * 2) / 2; // 0.5 s
+    if (Array.isArray(out.listen_groups)) {
+        out.listen_groups = out.listen_groups.map((g) => {
+            if (!g || typeof g !== 'object') return g;
+            return {
+                ...g,
+                fill_ratio: qFill(g.fill_ratio),
+                buffer_seconds: qBuf(g.buffer_seconds),
+            };
+        });
+    }
+    if (out.fill_ratios && typeof out.fill_ratios === 'object') {
+        const fr = {};
+        for (const [k, v] of Object.entries(out.fill_ratios)) {
+            fr[k] = qFill(v);
+        }
+        out.fill_ratios = fr;
+    }
+    return out;
+}
+
+function diffPulseExclusive(curr, prev) {
+    const a = normalizePulseExclusive(curr || {});
+    const b = normalizePulseExclusive(prev || {});
+    if (stableStringify(a) === stableStringify(b)) return null;
+    return cloneJson(a);
+}
+
+function diffConfigFields(curr, prev) {
+    const out = {};
+    let changed = false;
+    const keys = new Set([
+        ...Object.keys(curr || {}),
+        ...Object.keys(prev || {}),
+    ]);
+    for (const key of keys) {
+        const a = curr ? curr[key] : undefined;
+        const b = prev ? prev[key] : undefined;
+        if (stableStringify(a) !== stableStringify(b)) {
+            out[key] = a === undefined ? null : a;
+            changed = true;
+        }
+    }
+    return changed ? out : null;
+}
+
+/**
+ * Build a patch message from current vs last-sent snapshots.
+ * Returns null when nothing changed.
+ */
+function computePatch(current, lastSent) {
+    if (!lastSent) return null;
+    const patch = { type: 'patch' };
+    let any = false;
+
+    const chDiff = diffEntityList(
+        listFromSection(current.channels, 'channels'),
+        listFromSection(lastSent.channels, 'channels'),
+        ['stream_id', 'id']
+    );
+    if (chDiff) {
+        patch.channels = chDiff;
+        any = true;
+    }
+
+    const grDiff = diffEntityList(
+        listFromSection(current.groups, 'groups'),
+        listFromSection(lastSent.groups, 'groups'),
+        ['group_id', 'id', 'stream_id']
+    );
+    if (grDiff) {
+        patch.groups = grDiff;
+        any = true;
+    }
+
+    const currTp = current.tetrapol || {};
+    const prevTp = lastSent.tetrapol || {};
+    const tp = {};
+    let tpAny = false;
+
+    if (!!currTp.connected !== !!prevTp.connected) {
+        tp.connected = !!currTp.connected;
+        tpAny = true;
+    }
+
+    const tpCh = diffEntityList(
+        listFromSection(currTp.channels, 'channels'),
+        listFromSection(prevTp.channels, 'channels'),
+        ['channel_id', 'id']
+    );
+    if (tpCh) {
+        tp.channels = tpCh;
+        tpAny = true;
+    }
+
+    const tpGr = diffEntityList(
+        listFromSection(currTp.groups, 'groups'),
+        listFromSection(prevTp.groups, 'groups'),
+        ['group_id', 'id']
+    );
+    if (tpGr) {
+        tp.groups = tpGr;
+        tpAny = true;
+    }
+
+    const tpCells = diffEntityList(
+        listFromSection(currTp.cells, 'cells'),
+        listFromSection(prevTp.cells, 'cells'),
+        ['channel_id', 'id']
+    );
+    if (tpCells) {
+        tp.cells = tpCells;
+        tpAny = true;
+    }
+
+    const tpPe = diffPulseExclusive(currTp.pulse_exclusive || {}, prevTp.pulse_exclusive || {});
+    if (tpPe) {
+        tp.pulse_exclusive = tpPe;
+        tpAny = true;
+    }
+
+    if (tpAny) {
+        patch.tetrapol = tp;
+        any = true;
+    }
+
+    const sources = diffPlainObject(current.sources, lastSent.sources);
+    if (sources) {
+        patch.sources = sources;
+        any = true;
+    }
+
+    const config = diffConfigFields(current.config, lastSent.config);
+    if (config) {
+        patch.config = config;
+        any = true;
+    }
+
+    const pe = diffPulseExclusive(current.pulse_exclusive || {}, lastSent.pulse_exclusive || {});
+    if (pe) {
+        patch.pulse_exclusive = pe;
+        any = true;
+    }
+
+    const arb = diffPlainObject(current.pulse_arbiter, lastSent.pulse_arbiter);
+    if (arb !== null) {
+        // null arbiter → explicit null; object when changed
+        patch.pulse_arbiter = current.pulse_arbiter == null ? null : arb;
+        any = true;
+    }
+
+    const networks = diffPlainObject(current.NETWORKS, lastSent.NETWORKS);
+    if (networks) {
+        patch.NETWORKS = networks;
+        any = true;
+    }
+
+    const icecast = diffPlainObject(current.icecast, lastSent.icecast);
+    if (icecast) {
+        patch.icecast = icecast;
+        any = true;
+    }
+
+    return any ? patch : null;
+}
+
+function eventDedupKey(event) {
+    if (!event || typeof event !== 'object') return 'unknown';
+    const name = event.event != null ? String(event.event) : 'event';
+    const ch = event.channel_id != null ? String(event.channel_id) : '';
+    return `${name}|${ch}`;
+}
+
 class WsBridge {
     constructor(config = {}) {
         this.config = { ...DEFAULT_CONFIG, ...config };
@@ -82,7 +320,12 @@ class WsBridge {
             tetrapol: { ws: null, connected: false, retries: 0, timer: null, lastMsgAt: 0 },
         };
         this.broadcastTimer = null;
+        this.fullSyncTimer = null;
         this.dirty = false;
+        /** @type {object|null} Last snapshot actually sent to clients (for patch diffs). */
+        this.lastSent = null;
+        /** Last serialized event payload per dedup key. */
+        this._lastEventByKey = new Map();
         this.wss = null;
         this.arbiter = this.config.pulseArbiter === false
             ? null
@@ -103,10 +346,18 @@ class WsBridge {
     attach(server) {
         this.wss = new WebSocketServer({ noServer: true });
         this.wss.on('connection', (socket) => {
+            // Flush pending patches to existing clients before a new snapshot baseline.
+            if (this.dirty && this.clients.size > 0) {
+                this.flushBroadcast();
+            }
             this.clients.add(socket);
             socket.on('close', () => this.clients.delete(socket));
             socket.on('error', () => this.clients.delete(socket));
-            this.send(socket, this.buildUpdate());
+            const full = this.buildUpdate();
+            this.send(socket, full);
+            // Align global lastSent so subsequent patches match what clients know.
+            this.lastSent = cloneJson(full);
+            this.dirty = false;
         });
         this.connectSource('airband', this.config.airbandWsUrl, (msg) => this.onAirbandMessage(msg));
         this.connectSource('tetrapol', this.config.tetrapolWsUrl, (msg) => this.onTetrapolMessage(msg));
@@ -114,6 +365,13 @@ class WsBridge {
             this.checkSourceFreshness();
             this.flushBroadcast();
         }, this.config.broadcastIntervalMs);
+        // Full resync only if something was dirty recently — avoid 15s spam
+        // when the wire is already quiet.
+        const fullMs = Math.max(5000, Number(this.config.fullSyncIntervalMs) || 30000);
+        this.fullSyncTimer = setInterval(() => {
+            if (this.clients.size === 0) return;
+            this.flushBroadcast({ forceFull: true });
+        }, fullMs);
         if (this.arbiter) this.arbiter.start();
     }
 
@@ -356,7 +614,8 @@ class WsBridge {
             this.state.pulse_exclusive,
             this.state.tetrapol && this.state.tetrapol.pulse_exclusive
         );
-        this.dirty = true;
+        // Do not force dirty here: arbiter onChange notifies real changes;
+        // upstream handlers already set dirty for telemetry sections.
     }
 
     buildUpdate() {
@@ -392,25 +651,43 @@ class WsBridge {
         socket.send(JSON.stringify(payload));
     }
 
-    broadcastEvent(event) {
-        const raw = JSON.stringify(event);
+    broadcastRaw(raw) {
         for (const client of this.clients) {
             if (client.readyState === WebSocket.OPEN) client.send(raw);
         }
     }
 
-    flushBroadcast() {
-        if (!this.dirty && this.clients.size === 0) return;
-        this.dirty = false;
-        const payload = JSON.stringify(this.buildUpdate());
-        for (const client of this.clients) {
-            if (client.readyState !== WebSocket.OPEN) continue;
-            client.send(payload);
+    broadcastEvent(event) {
+        const key = eventDedupKey(event);
+        const raw = JSON.stringify(event);
+        if (this._lastEventByKey.get(key) === raw) return;
+        this._lastEventByKey.set(key, raw);
+        this.broadcastRaw(raw);
+    }
+
+    flushBroadcast({ forceFull = false } = {}) {
+        if (this.clients.size === 0) return;
+        if (!forceFull && !this.dirty) return;
+
+        const current = this.buildUpdate();
+
+        if (forceFull || !this.lastSent) {
+            this.dirty = false;
+            this.lastSent = cloneJson(current);
+            this.broadcastRaw(JSON.stringify(current));
+            return;
         }
+
+        this.dirty = false;
+        const patch = computePatch(current, this.lastSent);
+        if (!patch) return;
+        this.lastSent = cloneJson(current);
+        this.broadcastRaw(JSON.stringify(patch));
     }
 
     close() {
         if (this.broadcastTimer) clearInterval(this.broadcastTimer);
+        if (this.fullSyncTimer) clearInterval(this.fullSyncTimer);
         if (this.arbiter) this.arbiter.stop();
         for (const src of Object.values(this.sources)) {
             if (src.timer) clearTimeout(src.timer);
@@ -418,7 +695,14 @@ class WsBridge {
         }
         if (this.wss) this.wss.close();
         this.clients.clear();
+        this._lastEventByKey.clear();
+        this.lastSent = null;
     }
 }
 
-module.exports = { WsBridge, DEFAULT_CONFIG };
+module.exports = {
+    WsBridge,
+    DEFAULT_CONFIG,
+    computePatch,
+    diffEntityList,
+};

@@ -128,15 +128,33 @@ class PulseArbiter {
     }
 
     snapshot() {
+        const qFill = (v) => Math.floor((Number(v) || 0) * 100) / 100;
+        // Stable client-facing shape: omit last_heartbeat_at / busy, quantize fills.
+        let active = null;
+        if (this.globalActive) {
+            const a = this.globalActive;
+            active = {
+                source: a.source,
+                id: a.id,
+                priority: !!a.priority,
+                fill_ratio: qFill(a.fill_ratio),
+                buffer_force_promoted: !!a.buffer_force_promoted,
+                force_before_full: !!a.force_before_full,
+            };
+        }
         return {
             enabled: this.enabled,
             monitor_alive: this.enabled,
             monitor_id: this.monitorId,
             lease_ms: HEARTBEAT_LEASE_MS,
-            last_heartbeat_at: this._lastHeartbeatAt || null,
-            active: this.globalActive ? { ...this.globalActive } : null,
-            queue: this.globalQueue.map((s) => ({ ...s })),
-            busy: this._busy,
+            active,
+            queue: this.globalQueue.map((s) => ({
+                source: s.source,
+                id: s.id,
+                priority: !!s.priority,
+                fill_ratio: qFill(s.fill_ratio),
+                buffer_force_promoted: !!s.buffer_force_promoted,
+            })),
             sources: { ...this._sourceConnected },
         };
     }

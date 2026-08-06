@@ -3238,10 +3238,11 @@
             const pe = e.source === 'tetrapol'
                 ? (tpListen.get(String(e.rawId)) || {})
                 : (abListen.get(String(e.rawId)) || {});
+            // 1% / 0.5 s floor buckets — match ws-bridge quantization
             return [
                 e.key,
-                Math.round((Number(pe.fill_ratio) || 0) * 1000),
-                Math.round((Number(pe.buffer_seconds) || 0) * 10)
+                Math.floor((Number(pe.fill_ratio) || 0) * 100),
+                Math.floor((Number(pe.buffer_seconds) || 0) * 2)
             ];
         }));
         const needStruct = structSig !== lastPulseSig;
@@ -4007,7 +4008,7 @@
         updateReceptionDisplay();
     }
 
-    function onMonitorUpdate(msg) {
+    function applyMonitorSourcesAndConfig(msg) {
         const wasAirband = airbandBridged;
         if (msg.sources) {
             if (msg.sources.airband != null) airbandBridged = !!msg.sources.airband;
@@ -4022,22 +4023,11 @@
             const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
             if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
         }
+        return wasAirband;
+    }
 
-        if (wasAirband && !airbandBridged) {
-            markAirbandOffline();
-        } else if (airbandBridged) {
-            const channels = (msg.channels && msg.channels.channels) || [];
-            airbandById = new Map(channels.map(c => [c.stream_id, c]));
-            updateAirbandTable(channels);
-        }
-
-        if (msg.tetrapol) applyTetrapolFromBridge(msg.tetrapol);
-        rebuildCatalog();
-        refreshExclusiveSegmentEntries();
-        updateAirbandButtons();
-        updateReceptionDisplay();
-        syncPlayersFromCatalog();
-        if (msg.pulse_arbiter) pulseArbiterState = msg.pulse_arbiter;
+    function applyPulseExclusiveFromMsg(msg) {
+        if (msg.pulse_arbiter !== undefined) pulseArbiterState = msg.pulse_arbiter;
         if (airbandBridged && msg.pulse_exclusive) {
             const remote = msg.pulse_exclusive;
             if (Date.now() < pulseLocalEditUntil && pulseExclusiveState) {
@@ -4064,7 +4054,9 @@
                 tpPulseExclusiveState = remoteTp;
             }
         }
-        updatePulseAdmin();
+    }
+
+    function refreshMonitorConnectionStatus() {
         setDot(el.channelsStatus, airbandBridged && [...airbandById.values()].some(c => c.on_air));
         if (el.connectionStatus) {
             const ab = airbandBridged
@@ -4078,6 +4070,232 @@
             el.connectionStatus.style.color = (!airbandBridged || (tetrapolWsUrl && !tetrapolBridged))
                 ? '#c66'
                 : '';
+        }
+    }
+
+    function applyTetrapolChannelsPatch(patch) {
+        if (!patch) return false;
+        let list = tetrapolChannels.slice();
+        const byId = new Map(list.map((c) => [String(c.channel_id), c]));
+        let changed = false;
+        if (Array.isArray(patch.remove)) {
+            patch.remove.forEach((rawId) => {
+                const id = String(rawId);
+                if (byId.has(id)) {
+                    byId.delete(id);
+                    changed = true;
+                }
+            });
+        }
+        if (Array.isArray(patch.upsert)) {
+            patch.upsert.forEach((item) => {
+                if (!item || item.channel_id == null) return;
+                byId.set(String(item.channel_id), item);
+                changed = true;
+            });
+        }
+        if (changed) tetrapolChannels = [...byId.values()];
+        return changed;
+    }
+
+    function applyTetrapolGroupsPatch(patch) {
+        if (!patch) return false;
+        let changed = false;
+        if (Array.isArray(patch.remove)) {
+            patch.remove.forEach((rawId) => {
+                const gid = String(rawId);
+                if (tetrapolGroups.has(gid)) {
+                    tetrapolGroups.delete(gid);
+                    changed = true;
+                }
+            });
+        }
+        if (Array.isArray(patch.upsert)) {
+            patch.upsert.forEach((g) => {
+                if (!g || g.group_id == null) return;
+                const gid = String(g.group_id);
+                tetrapolGroups.set(gid, Object.assign({}, g, {
+                    listen: g.listen !== false,
+                    encrypted: !!g.encrypted
+                }));
+                changed = true;
+            });
+        }
+        return changed;
+    }
+
+    function applyTetrapolCellsPatch(patch) {
+        if (!patch) return false;
+        let changed = false;
+        if (Array.isArray(patch.remove)) {
+            patch.remove.forEach((rawId) => {
+                const channelId = Number(rawId);
+                if (tetrapolCells.has(channelId)) {
+                    tetrapolCells.delete(channelId);
+                    changed = true;
+                }
+            });
+        }
+        if (Array.isArray(patch.upsert) && patch.upsert.length) {
+            applyTetrapolCellsSnapshot(patch.upsert);
+            changed = true;
+        }
+        return changed;
+    }
+
+    function applyTetrapolPatch(tp) {
+        if (!tp) return false;
+        let changed = false;
+        if (tp.connected != null) {
+            const next = !!tp.connected;
+            if (next !== tetrapolBridged) {
+                tetrapolBridged = next;
+                changed = true;
+            }
+            if (el.tetrapolSection) {
+                el.tetrapolSection.style.display = (tetrapolBridged || tetrapolWsUrl)
+                    ? 'block'
+                    : el.tetrapolSection.style.display;
+            }
+            const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
+            if (tpTitle && (tetrapolBridged || tetrapolWsUrl)) tpTitle.style.display = '';
+            if (!tetrapolBridged) {
+                tetrapolCells.forEach((c) => {
+                    if (c.syncStatus !== 'lost') c.syncStatus = 'unsynced';
+                });
+                tetrapolChannels = [];
+                markAllCellsUnsynced('disconnect');
+                changed = true;
+            }
+        }
+        if (tetrapolBridged) {
+            if (applyTetrapolChannelsPatch(tp.channels)) changed = true;
+            if (applyTetrapolGroupsPatch(tp.groups)) changed = true;
+            if (applyTetrapolCellsPatch(tp.cells)) changed = true;
+            // Ensure groups exist for any channel group_id (same as full apply).
+            tetrapolChannels.forEach((c) => {
+                if (c.group_id == null) return;
+                const gid = String(c.group_id);
+                if (!tetrapolGroups.has(gid)) {
+                    tetrapolGroups.set(gid, {
+                        group_id: gid,
+                        group_label: c.group_label || gid,
+                        on_air: !!c.on_air,
+                        encrypted: !!c.encrypted,
+                        listen: true
+                    });
+                    changed = true;
+                } else if (c.encrypted) {
+                    tetrapolGroups.get(gid).encrypted = true;
+                }
+            });
+            scanTetrapolClearGroups();
+        }
+        if (tp.pulse_exclusive) {
+            // Pulse fills are applied via applyPulseExclusiveFromMsg — do not
+            // treat them as listing changes (would force tetrapol button redraws).
+        }
+        if (changed) {
+            lastTpSig = '';
+            lastReceptionSig = '';
+            updateTetrapolListing();
+            updateReceptionDisplay();
+            setDot(el.tetrapolStatus, tetrapolBridged && (
+                tetrapolChannels.some(c => c.on_air)
+                || [...tetrapolGroups.values()].some(g => g.on_air)
+            ));
+            if (!tetrapolBridged && el.tetrapolStatus) {
+                setDot(el.tetrapolStatus, false);
+            }
+        }
+        return changed;
+    }
+
+    function onMonitorUpdate(msg) {
+        const wasAirband = applyMonitorSourcesAndConfig(msg);
+
+        if (wasAirband && !airbandBridged) {
+            markAirbandOffline();
+        } else if (airbandBridged) {
+            const channels = (msg.channels && msg.channels.channels) || [];
+            airbandById = new Map(channels.map(c => [c.stream_id, c]));
+            updateAirbandTable(channels);
+        }
+
+        if (msg.tetrapol) applyTetrapolFromBridge(msg.tetrapol);
+        rebuildCatalog();
+        refreshExclusiveSegmentEntries();
+        updateAirbandButtons();
+        updateReceptionDisplay();
+        syncPlayersFromCatalog();
+        applyPulseExclusiveFromMsg(msg);
+        updatePulseAdmin();
+        refreshMonitorConnectionStatus();
+    }
+
+    /** Incremental bridge patch — merge entity upserts/removes into local state. */
+    function onMonitorPatch(msg) {
+        const wasAirband = applyMonitorSourcesAndConfig(msg);
+        let airChanged = false;
+        let tpChanged = false;
+
+        if (wasAirband && !airbandBridged) {
+            markAirbandOffline();
+            airChanged = true;
+        } else if (airbandBridged && msg.channels) {
+            if (Array.isArray(msg.channels.remove)) {
+                msg.channels.remove.forEach((rawId) => {
+                    if (airbandById.has(rawId)) {
+                        airbandById.delete(rawId);
+                        airChanged = true;
+                    } else {
+                        const n = Number(rawId);
+                        if (Number.isFinite(n) && airbandById.has(n)) {
+                            airbandById.delete(n);
+                            airChanged = true;
+                        } else if (airbandById.has(String(rawId))) {
+                            airbandById.delete(String(rawId));
+                            airChanged = true;
+                        }
+                    }
+                });
+            }
+            if (Array.isArray(msg.channels.upsert)) {
+                msg.channels.upsert.forEach((item) => {
+                    if (!item || item.stream_id == null) return;
+                    airbandById.set(item.stream_id, item);
+                    airChanged = true;
+                });
+            }
+            if (airChanged) {
+                updateAirbandTable([...airbandById.values()]);
+            }
+        }
+
+        if (msg.tetrapol) tpChanged = !!applyTetrapolPatch(msg.tetrapol);
+
+        const listingChanged = airChanged || tpChanged || !!msg.groups;
+        const pulseChanged = msg.pulse_exclusive != null
+            || msg.pulse_arbiter !== undefined
+            || !!(msg.tetrapol && msg.tetrapol.pulse_exclusive != null);
+
+        if (listingChanged) {
+            rebuildCatalog();
+            refreshExclusiveSegmentEntries();
+            updateAirbandButtons();
+            updateReceptionDisplay();
+            syncPlayersFromCatalog();
+        }
+        if (pulseChanged) {
+            // Fill-only: update pulse state/bars — no catalog/button rebuild.
+            applyPulseExclusiveFromMsg(msg);
+            if (listingChanged) refreshExclusiveSegmentEntries();
+            updatePulseAdmin();
+        } else if (msg.sources || msg.config) {
+            refreshMonitorConnectionStatus();
+        }
+        if (listingChanged || pulseChanged) {
+            refreshMonitorConnectionStatus();
         }
     }
 
@@ -4110,6 +4328,10 @@
                 const msg = JSON.parse(ev.data);
                 if (msg.type === 'update') {
                     onMonitorUpdate(msg);
+                    return;
+                }
+                if (msg.type === 'patch') {
+                    onMonitorPatch(msg);
                     return;
                 }
                 if (msg.event && handleTetrapolCellEvent(msg))
