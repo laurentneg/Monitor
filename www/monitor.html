@@ -94,6 +94,22 @@
         <div id="connectionStatus" class="admin-action-status" style="margin-top: 0.5em;">Connexion…</div>
     </div>
 
+    <!-- Projets / devices / réseaux : visibles après « Activer l'audio » (comme Tetrapol kit) -->
+    <div class="section section-collapsible" id="scopeButtonsSection" style="display: none;">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="scopeButtonsSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            🎛️ Projets, devices &amp; réseaux
+        </h2>
+        <div class="section-collapsible-body" id="scopeButtonsSectionBody">
+            <h3 class="group-buttons-subtitle">Projets</h3>
+            <div id="projectButtonsContainer" class="group-buttons-grid"></div>
+            <h3 class="group-buttons-subtitle" id="deviceButtonsTitle">✈️ Devices Analogique</h3>
+            <div id="deviceButtonsContainer" class="group-buttons-grid"></div>
+            <h3 class="group-buttons-subtitle" id="networkButtonsTitle" style="display: none;">🌐 Réseaux Tetrapol</h3>
+            <div id="networkButtonsContainer" class="group-buttons-grid"></div>
+        </div>
+    </div>
+
     <!-- Groupes : visibles seulement après « Activer l'audio », indépendants des listes transmissions -->
     <div class="section section-collapsible" id="groupButtonsSection" style="display: none;">
         <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="groupButtonsSectionBody">

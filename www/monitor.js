@@ -58,6 +58,23 @@
     let forceBeforeFull = localStorage.getItem('exclusiveForceBeforeBufferFull') !== 'false';
     let disabledAirband = new Set(JSON.parse(localStorage.getItem('disabledAirbandStreams') || '[]').map(String));
     let disabledTetrapol = new Set(JSON.parse(localStorage.getItem('disabledTetrapolGroups') || '[]').map(String));
+    /** Projet entier désactivé : 'airband' | 'tetrapol' (écoute Icecast UI uniquement). */
+    let disabledSources = new Set(JSON.parse(localStorage.getItem('disabledMonitorSources') || '[]').map(String));
+    /** Devices Airband désactivés (index device en string). */
+    let disabledDevices = new Set(JSON.parse(localStorage.getItem('disabledAirbandDevices') || '[]').map(String));
+    /** Réseaux Tetrapol désactivés (2ᵉ segment RFSI), comme tetrapol-kit. */
+    let disabledNetworks = new Set(JSON.parse(localStorage.getItem('disabledNetworks') || '[]').map(String));
+    /** network_id → label (depuis WS NETWORKS). */
+    let networkLabels = {};
+    /** Entités scope déjà vues — ne pas retirer tant que le projet n'est pas désactivé / absent confirmé. */
+    let knownScopeProjects = new Set(JSON.parse(localStorage.getItem('knownMonitorProjects') || '[]').map(String));
+    let knownScopeDevices = new Map(Object.entries(
+        JSON.parse(localStorage.getItem('knownAirbandDevices') || '{}')
+    ).map(([k, v]) => [String(k), Number(v) || 0]));
+    let knownScopeNetworks = new Map(Object.entries(
+        JSON.parse(localStorage.getItem('knownTetrapolNetworks') || '{}')
+    ).map(([k, v]) => [String(k), String(v || `Réseau ${k}`)]));
+    let lastScopeSig = '';
     /** Groupes Tetrapol vus en clair au moins une fois (gid → label), persisté localement. */
     let knownClearTetrapol = new Map(Object.entries(
         JSON.parse(localStorage.getItem('knownClearTetrapolGroups') || '{}')
@@ -136,6 +153,12 @@
         tetrapolGroups: document.getElementById('tetrapolGroupButtons'),
         streamsStatus: document.getElementById('streamsStatusIndicator'),
         receptionContainer: document.getElementById('receptionContainer'),
+        scopeSection: document.getElementById('scopeButtonsSection'),
+        projectButtons: document.getElementById('projectButtonsContainer'),
+        deviceButtons: document.getElementById('deviceButtonsContainer'),
+        networkButtons: document.getElementById('networkButtonsContainer'),
+        deviceButtonsTitle: document.getElementById('deviceButtonsTitle'),
+        networkButtonsTitle: document.getElementById('networkButtonsTitle'),
     };
 
     function setDot(node, ok) {
@@ -161,6 +184,16 @@
     function saveDisabled() {
         localStorage.setItem('disabledAirbandStreams', JSON.stringify([...disabledAirband]));
         localStorage.setItem('disabledTetrapolGroups', JSON.stringify([...disabledTetrapol]));
+        localStorage.setItem('disabledMonitorSources', JSON.stringify([...disabledSources]));
+        localStorage.setItem('disabledAirbandDevices', JSON.stringify([...disabledDevices]));
+        localStorage.setItem('disabledNetworks', JSON.stringify([...disabledNetworks]));
+        localStorage.setItem('knownMonitorProjects', JSON.stringify([...knownScopeProjects]));
+        const devObj = {};
+        knownScopeDevices.forEach((total, id) => { devObj[id] = total; });
+        localStorage.setItem('knownAirbandDevices', JSON.stringify(devObj));
+        const netObj = {};
+        knownScopeNetworks.forEach((label, id) => { netObj[id] = label; });
+        localStorage.setItem('knownTetrapolNetworks', JSON.stringify(netObj));
         localStorage.setItem('monitorPriorityKeys', JSON.stringify([...priorityKeys]));
         localStorage.setItem('monitorPulsePriorityKeys', JSON.stringify([...pulsePriorityKeys]));
     }
@@ -281,11 +314,124 @@
         });
     }
 
+    function extractNetworkId(rfsi) {
+        if (rfsi == null) return null;
+        const parts = String(rfsi).split('-');
+        return parts.length >= 2 && parts[1] ? String(parts[1]) : null;
+    }
+
+    /** Réseau Tetrapol d'un groupe (via RFSI des canaux on_air / connus). */
+    function networkIdForGroup(groupId) {
+        const gid = String(groupId);
+        let fallback = null;
+        for (const c of tetrapolChannels) {
+            if (String(c.group_id) !== gid || !c.rfsi) continue;
+            const nid = extractNetworkId(c.rfsi);
+            if (!nid) continue;
+            if (c.on_air) return nid;
+            if (!fallback) fallback = nid;
+        }
+        return fallback;
+    }
+
+    function deviceIdForEntry(entry) {
+        if (!entry || entry.source !== 'airband') return null;
+        const d = entry.meta && entry.meta.device;
+        if (d == null) return null;
+        return String(d);
+    }
+
+    function isSourceEnabled(source) {
+        return !disabledSources.has(source);
+    }
+
+    function isDeviceEnabled(deviceId) {
+        if (deviceId == null || deviceId === '') return true;
+        return !disabledDevices.has(String(deviceId));
+    }
+
+    function isNetworkEnabled(networkId) {
+        if (networkId == null || networkId === '') return true;
+        return !disabledNetworks.has(String(networkId));
+    }
+
     function isEnabled(entry) {
         if (!entry) return false;
-        const rawId = String(entry.rawId);
-        if (entry.source === 'airband') return !disabledAirband.has(rawId);
-        return !disabledTetrapol.has(rawId);
+        if (!isSourceEnabled(entry.source)) return false;
+        if (entry.source === 'airband') {
+            const dev = deviceIdForEntry(entry);
+            if (dev != null && !isDeviceEnabled(dev)) return false;
+            return !disabledAirband.has(String(entry.rawId));
+        }
+        const nid = networkIdForGroup(entry.rawId);
+        if (nid != null && !isNetworkEnabled(nid)) return false;
+        return !disabledTetrapol.has(String(entry.rawId));
+    }
+
+    function applyNetworksPayload(networksMsg) {
+        if (!networksMsg) return false;
+        const list = Array.isArray(networksMsg.networks)
+            ? networksMsg.networks
+            : (Array.isArray(networksMsg) ? networksMsg : null);
+        if (!list) return false;
+        const next = {};
+        list.forEach((n) => {
+            if (!n) return;
+            const id = n.network_id != null ? String(n.network_id) : null;
+            if (!id) return;
+            next[id] = String(n.network_label || n.label || `Réseau ${id}`);
+            knownScopeNetworks.set(id, next[id]);
+        });
+        const prev = JSON.stringify(networkLabels);
+        // Merge: ne pas perdre les labels connus si le payload est partiel.
+        networkLabels = { ...networkLabels, ...next };
+        return prev !== JSON.stringify(networkLabels);
+    }
+
+    /** Remember devices / networks / projects seen — lists stay until user disables the project. */
+    function rememberScopeFromLiveData() {
+        if (airbandBridged || airbandById.size) knownScopeProjects.add('airband');
+        if (tetrapolBridged || tetrapolWsUrl || tetrapolChannels.length || tetrapolGroups.size) {
+            knownScopeProjects.add('tetrapol');
+        }
+        airbandById.forEach((ch) => {
+            if (ch.device == null) return;
+            const id = String(ch.device);
+            const prev = knownScopeDevices.get(id) || 0;
+            // Compter les fréquences courantes si disponibles, sinon garder le max connu.
+            let n = 0;
+            airbandById.forEach((c) => { if (String(c.device) === id) n += 1; });
+            knownScopeDevices.set(id, Math.max(prev, n));
+        });
+        Object.keys(networkLabels).forEach((id) => {
+            knownScopeNetworks.set(id, networkLabels[id] || knownScopeNetworks.get(id) || `Réseau ${id}`);
+        });
+        tetrapolChannels.forEach((c) => {
+            const nid = extractNetworkId(c.rfsi);
+            if (!nid) return;
+            if (!knownScopeNetworks.has(nid)) {
+                knownScopeNetworks.set(nid, networkLabels[nid] || `Réseau ${nid}`);
+            }
+        });
+    }
+
+    function stopStreamsMatching(pred) {
+        catalog.forEach((entry) => {
+            if (pred(entry)) stopStreamMonitoring(entry);
+        });
+    }
+
+    function refreshAfterScopeChange() {
+        lastAirBtnSig = '';
+        lastTpSig = '';
+        lastReceptionSig = '';
+        lastScopeSig = '';
+        saveDisabled();
+        updateScopeButtons();
+        updateAirbandButtons();
+        updateTetrapolListing();
+        updateReceptionDisplay();
+        if (audioEnabled) syncPlayersFromCatalog();
     }
 
     /** Entrée éligible à une carte stream (activée, courante en scan, non chiffrée). */
@@ -1408,6 +1554,216 @@
             if (Number.isFinite(numA) && Number.isFinite(numB) && numA !== numB) return numA - numB;
             return String(a.rawId).localeCompare(String(b.rawId), undefined, { numeric: true });
         });
+    }
+
+    function syncScopeButton(container, id, opts) {
+        if (!container) return null;
+        let btn = container.querySelector('.group-btn[data-scope-id="' + esc(id) + '"]');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'group-btn';
+            btn.dataset.scopeId = id;
+            btn.dataset.scopeKind = opts.kind;
+            const span = document.createElement('span');
+            span.className = 'group-btn-label';
+            btn.appendChild(span);
+            btn.addEventListener('click', () => {
+                if (opts.kind === 'project') toggleProjectMonitoring(id);
+                else if (opts.kind === 'device') toggleDeviceMonitoring(id);
+                else if (opts.kind === 'network') toggleNetworkMonitoring(id);
+            });
+            container.appendChild(btn);
+        }
+        const span = btn.querySelector('.group-btn-label');
+        if (span) span.textContent = opts.label;
+        btn.classList.toggle('enabled', !!opts.enabled);
+        btn.classList.toggle('on-air', !!opts.onAir);
+        btn.title = opts.title || opts.label;
+        return btn;
+    }
+
+    function updateScopeButtons() {
+        if (isAdminPage) {
+            if (el.scopeSection) el.scopeSection.style.display = 'none';
+            return;
+        }
+        if (!audioEnabled) {
+            if (el.scopeSection) el.scopeSection.style.display = 'none';
+            lastScopeSig = '';
+            return;
+        }
+        if (el.scopeSection) el.scopeSection.style.display = '';
+
+        rememberScopeFromLiveData();
+
+        // Live on-air / counts overlay sticky known sets — never wipe on empty tick.
+        const liveDevices = new Map();
+        airbandById.forEach((ch) => {
+            if (ch.device == null) return;
+            const id = String(ch.device);
+            if (!liveDevices.has(id)) liveDevices.set(id, { onAir: false, total: 0 });
+            const info = liveDevices.get(id);
+            info.total += 1;
+            if (ch.on_air) info.onAir = true;
+        });
+        knownScopeDevices.forEach((total, id) => {
+            if (!liveDevices.has(id)) liveDevices.set(id, { onAir: false, total });
+            else liveDevices.get(id).total = Math.max(liveDevices.get(id).total, total);
+        });
+
+        const networkIds = new Set([
+            ...knownScopeNetworks.keys(),
+            ...Object.keys(networkLabels)
+        ]);
+        tetrapolChannels.forEach((c) => {
+            const nid = extractNetworkId(c.rfsi);
+            if (nid) networkIds.add(nid);
+        });
+        const networks = [...networkIds].sort((a, b) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0));
+
+        const abOnAir = [...airbandById.values()].some((c) => c.on_air);
+        const tpOnAir = tetrapolChannels.some((c) => c.on_air)
+            || [...tetrapolGroups.values()].some((g) => g.on_air);
+
+        const sig = JSON.stringify({
+            ab: [airbandBridged, isSourceEnabled('airband'), abOnAir ? 1 : 0],
+            tp: [tetrapolBridged || !!tetrapolWsUrl, isSourceEnabled('tetrapol'), tpOnAir ? 1 : 0],
+            d: [...liveDevices.entries()].map(([id, d]) => [id, isDeviceEnabled(id) ? 1 : 0, d.onAir ? 1 : 0, d.total]),
+            n: networks.map((id) => [
+                id,
+                isNetworkEnabled(id) ? 1 : 0,
+                tetrapolChannels.some((c) => extractNetworkId(c.rfsi) === id && c.on_air) ? 1 : 0,
+                knownScopeNetworks.get(id) || networkLabels[id] || ''
+            ]),
+            proj: [...knownScopeProjects].sort(),
+            src: [...disabledSources].sort(),
+            devices: [...disabledDevices].sort(),
+            nets: [...disabledNetworks].sort()
+        });
+        if (sig === lastScopeSig) return;
+        lastScopeSig = sig;
+        saveDisabled();
+
+        // Projets — sticky once seen (ne pas retirer sur un tick offline).
+        if (el.projectButtons) {
+            const wanted = new Set(knownScopeProjects);
+            if (wanted.has('airband') || airbandBridged || airbandById.size) {
+                wanted.add('airband');
+                knownScopeProjects.add('airband');
+                syncScopeButton(el.projectButtons, 'airband', {
+                    kind: 'project',
+                    label: '✈️ Analogique',
+                    enabled: isSourceEnabled('airband'),
+                    onAir: abOnAir,
+                    title: 'Activer / désactiver tout le projet Analogique (écoute navigateur)'
+                });
+            }
+            if (wanted.has('tetrapol') || tetrapolBridged || tetrapolWsUrl || tetrapolChannels.length) {
+                wanted.add('tetrapol');
+                knownScopeProjects.add('tetrapol');
+                syncScopeButton(el.projectButtons, 'tetrapol', {
+                    kind: 'project',
+                    label: '📻 Tetrapol',
+                    enabled: isSourceEnabled('tetrapol'),
+                    onAir: tpOnAir,
+                    title: 'Activer / désactiver tout le projet Tetrapol (écoute navigateur)'
+                });
+            }
+            [...el.projectButtons.querySelectorAll('.group-btn')].forEach((btn) => {
+                if (!wanted.has(btn.dataset.scopeId)) btn.remove();
+            });
+        }
+
+        // Devices — restent affichés même projet désactivé / offline temporaire.
+        const showDevices = liveDevices.size > 0;
+        if (el.deviceButtonsTitle) el.deviceButtonsTitle.style.display = showDevices ? '' : 'none';
+        if (el.deviceButtons && showDevices) {
+            const sorted = [...liveDevices.entries()]
+                .map(([id, d]) => ({ id, ...d }))
+                .sort((a, b) => Number(a.id) - Number(b.id));
+            const wanted = new Set(sorted.map((d) => d.id));
+            sorted.forEach((d) => {
+                const parentOn = isSourceEnabled('airband');
+                syncScopeButton(el.deviceButtons, d.id, {
+                    kind: 'device',
+                    label: `Device ${d.id}`,
+                    enabled: parentOn && isDeviceEnabled(d.id),
+                    onAir: d.onAir,
+                    title: parentOn
+                        ? `Device ${d.id} — ${d.total} fréquence(s)`
+                        : 'Projet Analogique désactivé — liste conservée'
+                });
+            });
+            [...el.deviceButtons.querySelectorAll('.group-btn')].forEach((btn) => {
+                if (!wanted.has(btn.dataset.scopeId)) btn.remove();
+            });
+        }
+
+        // Réseaux — sticky.
+        const showNets = networks.length > 0;
+        if (el.networkButtonsTitle) el.networkButtonsTitle.style.display = showNets ? '' : 'none';
+        if (el.networkButtons && showNets) {
+            const wanted = new Set(networks);
+            networks.forEach((id) => {
+                const parentOn = isSourceEnabled('tetrapol');
+                const onAir = tetrapolChannels.some(
+                    (c) => extractNetworkId(c.rfsi) === id && c.on_air
+                );
+                const label = knownScopeNetworks.get(id) || networkLabels[id] || `Réseau ${id}`;
+                syncScopeButton(el.networkButtons, id, {
+                    kind: 'network',
+                    label,
+                    enabled: parentOn && isNetworkEnabled(id),
+                    onAir,
+                    title: parentOn
+                        ? `Réseau ${id}`
+                        : 'Projet Tetrapol désactivé — liste conservée'
+                });
+            });
+            [...el.networkButtons.querySelectorAll('.group-btn')].forEach((btn) => {
+                if (!wanted.has(btn.dataset.scopeId)) btn.remove();
+            });
+        }
+    }
+
+    function toggleProjectMonitoring(source) {
+        if (source !== 'airband' && source !== 'tetrapol') return;
+        if (isSourceEnabled(source)) {
+            disabledSources.add(source);
+            stopStreamsMatching((e) => e.source === source);
+        } else {
+            disabledSources.delete(source);
+        }
+        refreshAfterScopeChange();
+    }
+
+    function toggleDeviceMonitoring(deviceId) {
+        const id = String(deviceId);
+        if (isDeviceEnabled(id)) {
+            disabledDevices.add(id);
+            stopStreamsMatching((e) => deviceIdForEntry(e) === id);
+        } else {
+            disabledDevices.delete(id);
+            // Réactiver le projet si on réactive un device
+            disabledSources.delete('airband');
+        }
+        refreshAfterScopeChange();
+    }
+
+    function toggleNetworkMonitoring(networkId) {
+        const id = String(networkId);
+        if (isNetworkEnabled(id)) {
+            disabledNetworks.add(id);
+            stopStreamsMatching((e) => {
+                if (e.source !== 'tetrapol') return false;
+                return networkIdForGroup(e.rawId) === id;
+            });
+        } else {
+            disabledNetworks.delete(id);
+            disabledSources.delete('tetrapol');
+        }
+        refreshAfterScopeChange();
     }
 
     function updateAirbandButtons() {
@@ -3207,7 +3563,38 @@
             e.source === 'airband' && e.meta && e.meta.has_pulse);
         const tpPulse = [...catalog.values()].filter(e =>
             e.source === 'tetrapol' && !e.encrypted);
-        const pulseEntries = [...airPulse, ...tpPulse];
+        // Sticky: garder les groupes connus via télémétrie même si le catalog est vide un tick.
+        const pulseByKey = new Map([...airPulse, ...tpPulse].map((e) => [e.key, e]));
+        abListen.forEach((g, gid) => {
+            const key = airKey(gid);
+            if (pulseByKey.has(key)) return;
+            pulseByKey.set(key, {
+                key,
+                source: 'airband',
+                rawId: gid,
+                label: pulseGroupLabel(gid),
+                on_air: !!g.on_air,
+                meta: { has_pulse: true, listen: true },
+                has_stream: false,
+                streamUrl: null
+            });
+        });
+        tpListen.forEach((g, gid) => {
+            const key = tpKey(gid);
+            if (pulseByKey.has(key)) return;
+            pulseByKey.set(key, {
+                key,
+                source: 'tetrapol',
+                rawId: gid,
+                label: pulseGroupLabel(gid),
+                on_air: !!g.on_air,
+                encrypted: false,
+                meta: { listen: true, encrypted: false },
+                has_stream: true,
+                streamUrl: buildTetrapolUrl(gid)
+            });
+        });
+        const pulseEntries = [...pulseByKey.values()];
         const structSig = JSON.stringify({
             e: exclusive,
             a: displayActiveId,
@@ -3998,14 +4385,28 @@
         }));
         airbandById = new Map(inactiveListing.map((c) => [c.stream_id, c]));
         rebuildCatalog();
-        pulseExclusiveState = {};
+        // Keep last pulseExclusiveState so fill / listen lists stay until projet désactivé.
+        if (pulseExclusiveState && Array.isArray(pulseExclusiveState.listen_groups)) {
+            pulseExclusiveState = {
+                ...pulseExclusiveState,
+                active_group_id: null,
+                listen_groups: pulseExclusiveState.listen_groups.map((g) => ({
+                    ...g,
+                    on_air: false,
+                    is_active: false
+                }))
+            };
+        }
         lastAirSig = '\0';
         lastAirBtnSig = '';
         lastReceptionSig = '';
+        lastPulseSig = '';
+        lastPulseFillSig = '';
         setDot(el.channelsStatus, false);
         updateAirbandTable(inactiveListing.length ? inactiveListing : []);
         updateAirbandButtons();
         updateReceptionDisplay();
+        updatePulseAdmin();
     }
 
     function applyMonitorSourcesAndConfig(msg) {
@@ -4022,7 +4423,9 @@
             if (tetrapolWsUrl && el.tetrapolSection) el.tetrapolSection.style.display = 'block';
             const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
             if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
+            if (tetrapolWsUrl && el.networkButtonsTitle) el.networkButtonsTitle.style.display = '';
         }
+        if (msg.NETWORKS) applyNetworksPayload(msg.NETWORKS);
         return wasAirband;
     }
 
@@ -4039,9 +4442,9 @@
             } else {
                 pulseExclusiveState = remote;
             }
-        } else if (!airbandBridged) {
-            pulseExclusiveState = {};
         }
+        // Hors ligne : ne pas vider listen_groups / fills — la liste reste jusqu'à
+        // désactivation projet ou nouvelle télémétrie.
         if (msg.tetrapol && msg.tetrapol.pulse_exclusive) {
             const remoteTp = msg.tetrapol.pulse_exclusive;
             if (Date.now() < pulseLocalEditUntil && tpPulseExclusiveState) {
@@ -4225,6 +4628,7 @@
         if (msg.tetrapol) applyTetrapolFromBridge(msg.tetrapol);
         rebuildCatalog();
         refreshExclusiveSegmentEntries();
+        updateScopeButtons();
         updateAirbandButtons();
         updateReceptionDisplay();
         syncPlayersFromCatalog();
@@ -4286,6 +4690,11 @@
             updateReceptionDisplay();
             syncPlayersFromCatalog();
         }
+        if (msg.NETWORKS) {
+            applyNetworksPayload(msg.NETWORKS);
+            lastScopeSig = '';
+        }
+        updateScopeButtons();
         if (pulseChanged) {
             // Fill-only: update pulse state/bars — no catalog/button rebuild.
             applyPulseExclusiveFromMsg(msg);
@@ -4363,6 +4772,8 @@
                 if (buttonSection) buttonSection.style.display = 'none';
                 lastAirBtnSig = '';
                 lastTpSig = '';
+                lastScopeSig = '';
+                updateScopeButtons();
                 updateAirbandButtons();
                 updateTetrapolListing();
                 ensureStreamsSection();
