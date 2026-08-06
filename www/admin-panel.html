@@ -1,0 +1,40 @@
+<!-- Fragment admin partagé : inclus dans index.html et monitor.html (#admin) -->
+<div class="section" id="adminPulseAudioSection" style="display: none;">
+    <h2 class="streams-header">
+        <span class="streams-header-title">🔊 Groupes PulseAudio (Analogique + Tetrapol)</span>
+        <div class="streams-header-controls">
+            <div class="exclusive-mode-control">
+                <label for="pulseExclusivePlaybackToggle">
+                    🎯 Écoute en queue:
+                </label>
+                <input type="checkbox" id="pulseExclusivePlaybackToggle"
+                       aria-label="Activer l'écoute en queue PulseAudio">
+            </div>
+            <div class="exclusive-mode-control" id="pulseExclusiveForceBufferControl" style="display: none;">
+                <label for="pulseExclusiveForceBufferToggle">
+                    ⚡ Bascule avant fin tampon
+                </label>
+                <input type="checkbox" id="pulseExclusiveForceBufferToggle"
+                       aria-label="Forcer l'activation avant saturation du tampon PulseAudio">
+            </div>
+        </div>
+    </h2>
+    <div id="pulseAudioButtonsContainer" class="group-buttons-grid"></div>
+    <div id="pulseExclusiveStatusPanel" class="pulse-exclusive-status" style="display: none;">
+        <div id="pulseExclusiveStatusSummary" class="pulse-exclusive-summary">—</div>
+        <div id="pulseExclusiveStatusList" class="pulse-exclusive-list"></div>
+    </div>
+</div>
+
+<div class="section" id="adminReloadSection" style="display: none;">
+    <h2>⚙️ Administration</h2>
+    <div class="admin-actions">
+        <button id="reloadLabelsBtn" type="button" class="admin-action-btn admin-action-labels">
+            🔄 Rafraichir les labels
+        </button>
+        <button id="restartMixerBtn" type="button" class="admin-action-btn admin-action-restart">
+            ♻️ Redémarrer le mixer
+        </button>
+        <span id="reloadLabelsStatus" class="admin-action-status"></span>
+    </div>
+</div>

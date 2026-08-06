@@ -1,0 +1,4207 @@
+/**
+ * Unified Analogique + Tetrapol monitor
+ * - Two listings (enable/disable independently)
+ * - One "Activer l'audio"
+ * - Shared active cards + shared exclusive queue
+ */
+
+(function () {
+    'use strict';
+
+    const isAdminPage = document.body && document.body.dataset.adminPage === 'true';
+    let isAdminMode = isAdminPage || (typeof location !== 'undefined' && location.hash.includes('admin'));
+    // Activer tôt pour que queue-ring-buffer.js voie le flag dès l'ingestion.
+    try {
+        const h = String(location.hash || '').toLowerCase();
+        const q = String(location.search || '').toLowerCase();
+        window.__MONITOR_DEBUG__ = h.split(/[#&?/]/).some((p) => p.trim() === 'debug')
+            || /(?:^|[?&])debug(?:=|$|&)/.test(q);
+    } catch (_) {
+        window.__MONITOR_DEBUG__ = false;
+    }
+    const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/monitor';
+    const OFF_AIR_GRACE_MS = 5000; // drop empty exclusive queue items after off-air grace
+    // Fin de com : ~2 s de blanc gardés dans le ring (queue-ring-buffer blankMarginSec),
+    // puis 7 s d'attente avant fermeture. Si à la lecture effectiveBlankSec ≥ 7 → stop immédiat.
+    const STREAM_END_HOLD_MS = 7000;
+    /** Ignorer les parasites : ne pas ouvrir une carte avant 100 ms de com continue. */
+    const MIN_ON_AIR_START_MS = 100;
+    const SYNC_DEBOUNCE_MS = 150;
+    const RING_FORCE_PROMOTE_RATIO = 0.92;
+    const RING_YIELD_MAX_RATIO = 0.80;
+    const RING_UI_INTERVAL_MS = 250;
+    const CHANNEL_INACTIVE_HIDE_MS = 48 * 60 * 60 * 1000; // connected TCH
+    const CHANNEL_NOT_CONNECTED_HIDE_MS = 24 * 60 * 60 * 1000; // TCH not managed by CCH
+    const LONG_PRESS_MS = 450;
+    /** Thumb jitter on phones — too low cancels long-press priority. */
+    const MOVE_TOLERANCE = 36;
+    const GESTURE_GUARD_MS = 700;
+    /** Soft reconnect — avoids hammering Icecast (ERR_EMPTY_RESPONSE spam). */
+    const ICECAST_PLAYER_OPTS = {
+        metadataTypes: ['icy'],
+        enableLogging: false,
+        // Default is 1s — keep as low as practical so audio starts ASAP.
+        // 0 can underrun on reconnect; ~0.1s is usually the workable floor for MP3/MSE.
+        bufferLength: 0.1,
+        retryTimeout: 20,
+        retryDelayMin: 1.0,
+        retryDelayMax: 5.0,
+        retryDelayRate: 0.25
+    };
+
+    let icecastPublicBase = '';
+    let tetrapolWsUrl = '';
+    let tetrapolBridged = false;
+    let airbandBridged = false;
+    let audioEnabled = false;
+    let exclusivePlaybackMode = localStorage.getItem('exclusivePlaybackMode') === 'true';
+    let forceBeforeFull = localStorage.getItem('exclusiveForceBeforeBufferFull') !== 'false';
+    let disabledAirband = new Set(JSON.parse(localStorage.getItem('disabledAirbandStreams') || '[]').map(String));
+    let disabledTetrapol = new Set(JSON.parse(localStorage.getItem('disabledTetrapolGroups') || '[]').map(String));
+    /** Groupes Tetrapol vus en clair au moins une fois (gid → label), persisté localement. */
+    let knownClearTetrapol = new Map(Object.entries(
+        JSON.parse(localStorage.getItem('knownClearTetrapolGroups') || '{}')
+    ).map(([k, v]) => [String(k), String(v || k)]));
+    // Stream exclusive-queue priority (Icecast cards)
+    let priorityKeys = new Set(JSON.parse(localStorage.getItem('monitorPriorityKeys') || '[]'));
+    // Pulse exclusive priority (admin green buttons)
+    let pulsePriorityKeys = new Set(JSON.parse(localStorage.getItem('monitorPulsePriorityKeys') || '[]'));
+    // Ignore Tetrapol priority echoes briefly after a local TP priority edit.
+    let tpPulsePrioLocalUntil = 0;
+    let channelInactiveSince = {}; // channel_id -> ms when went inactive locally
+    let channelWasOnAir = {};
+    let inactiveRefreshTimer = null;
+
+    let airbandById = new Map();
+    let tetrapolGroups = new Map(); // group_id -> group info
+    let tetrapolChannels = [];
+    let tetrapolCells = new Map(); // channel_id -> cell sync state (from cell_info / cch_sync)
+    const CELL_INFO_TIMEOUT_MS = 25000;
+    let lastTetrapolCellFeedMs = 0;
+    /** @type {Map<string, object>} unified playable entries by key */
+    let catalog = new Map();
+
+    let players = new Map(); // key -> player entry
+    let exclusiveQueue = [];
+    let exclusiveActive = null;
+    let offAirSince = new Map();
+    let lastStreamTitles = {};
+    let pendingCardStarts = new Map(); // key -> timeout id (anti-parasite 0.1s)
+    let entryWasOnAir = new Map(); // key -> last seen on_air (for blank fallback)
+    let blankTimers = {};
+    let blankSince = {};
+    let blankDeadlines = {};
+    let inactivityStatusInterval = null;
+    let ringUiTimer = null;
+    let syncPlayersTimer = null;
+    let streamErrorLogAt = {};
+    let pulseExclusiveState = {};
+    let tpPulseExclusiveState = {};
+    let pulseArbiterState = null;
+    let pulsePanelDelegated = false;
+    let pulseControlInFlight = false;
+    let pulseLocalEditUntil = 0;
+    let departmentsMap = {};
+    let countriesMap = {};
+    let globalVolume = parseInt(localStorage.getItem('globalVolume') || '50', 10);
+
+    let lastAirSig = '';
+    let lastAirBtnSig = '';
+    let lastTpSig = '';
+    let lastPulseSig = '';
+    let lastPulseFillSig = '';
+    let lastReceptionSig = '';
+    let tetrapolConnecting = false;
+    let tetrapolWs = null; // unused — Tetrapol is bridged server-side
+    let ws = null;
+    let wsRetries = 0;
+
+    const el = {
+        channelsTableBody: document.getElementById('channelsTableBody'),
+        groupButtons: document.getElementById('groupButtonsContainer'),
+        groupButtonsSection: document.getElementById('groupButtonsSection'),
+        streamsSection: document.getElementById('streamsSection'),
+        streamsContainer: document.getElementById('streamsContainer'),
+        connectionStatus: document.getElementById('connectionStatus'),
+        channelsStatus: document.getElementById('channelsStatusIndicator'),
+        activateAudio: document.getElementById('activateAudio'),
+        exclusiveToggle: document.getElementById('exclusivePlaybackToggle'),
+        exclusiveForceToggle: document.getElementById('exclusiveForceBufferToggle'),
+        exclusiveForceControl: document.getElementById('exclusiveForceBufferControl'),
+        volumeSlider: document.getElementById('globalVolumeSlider'),
+        volumeValue: document.getElementById('globalVolumeValue'),
+        tetrapolSection: document.getElementById('tetrapolSection'),
+        tetrapolBody: document.getElementById('tetrapolChannelsBody'),
+        tetrapolStatus: document.getElementById('tetrapolStatusIndicator'),
+        tetrapolGroups: document.getElementById('tetrapolGroupButtons'),
+        streamsStatus: document.getElementById('streamsStatusIndicator'),
+        receptionContainer: document.getElementById('receptionContainer'),
+    };
+
+    function setDot(node, ok) {
+        if (!node) return;
+        node.style.cssText = 'display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:0.4em;background:' + (ok ? '#3c3' : '#c33');
+    }
+
+    function esc(id) {
+        return (window.CSS && CSS.escape) ? CSS.escape(id) : String(id).replace(/"/g, '\\"');
+    }
+
+    function escHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function airKey(streamId) { return 'ab:' + streamId; }
+    function tpKey(groupId) { return 'tp:' + groupId; }
+
+    function saveDisabled() {
+        localStorage.setItem('disabledAirbandStreams', JSON.stringify([...disabledAirband]));
+        localStorage.setItem('disabledTetrapolGroups', JSON.stringify([...disabledTetrapol]));
+        localStorage.setItem('monitorPriorityKeys', JSON.stringify([...priorityKeys]));
+        localStorage.setItem('monitorPulsePriorityKeys', JSON.stringify([...pulsePriorityKeys]));
+    }
+
+    function saveKnownClearTetrapol() {
+        const obj = {};
+        knownClearTetrapol.forEach((label, gid) => { obj[gid] = label; });
+        localStorage.setItem('knownClearTetrapolGroups', JSON.stringify(obj));
+    }
+
+    /** Mémoriser un groupe Tetrapol après une com en clair (pas chiffrée seule). */
+    function noteTetrapolClearGroup(channel) {
+        if (!channel || channel.encrypted) return;
+        const gid = String(channel.group_id || '').trim();
+        if (!gid) return;
+        const label = String(channel.group_label || knownClearTetrapol.get(gid) || gid).trim() || gid;
+        const prev = knownClearTetrapol.get(gid);
+        if (prev === label && knownClearTetrapol.has(gid)) return;
+        knownClearTetrapol.set(gid, label);
+        saveKnownClearTetrapol();
+        lastTpSig = '';
+    }
+
+    function scanTetrapolClearGroups() {
+        tetrapolChannels.forEach((c) => {
+            if (c.encrypted) return;
+            if (c.on_air || shouldDisplayChannelInTable(c)) {
+                noteTetrapolClearGroup(c);
+            }
+        });
+    }
+
+    /** Boutons Tetrapol : uniquement groupes déjà vus en clair (liste locale). */
+    function getTetrapolButtonEntries() {
+        const entries = [];
+        knownClearTetrapol.forEach((savedLabel, gid) => {
+            const key = tpKey(gid);
+            const fromCatalog = catalog.get(key);
+            if (fromCatalog && !fromCatalog.encrypted) {
+                entries.push(fromCatalog);
+                return;
+            }
+            entries.push({
+                key,
+                source: 'tetrapol',
+                rawId: gid,
+                label: fromCatalog?.label || savedLabel || gid,
+                on_air: !!(fromCatalog?.on_air || tetrapolGroups.get(gid)?.on_air),
+                encrypted: false,
+                has_stream: true,
+                streamUrl: buildTetrapolUrl(gid),
+                priority: isStreamPriority(key),
+                meta: { listen: true, encrypted: false, group_label: savedLabel || gid }
+            });
+        });
+        return entries;
+    }
+
+    function logStreamError(key, err) {
+        const now = Date.now();
+        if ((streamErrorLogAt[key] || 0) + 5000 > now) return;
+        streamErrorLogAt[key] = now;
+        console.warn('stream error', key, err);
+    }
+
+    function isDebugMode() {
+        try {
+            const hash = String(location.hash || '').toLowerCase();
+            if (hash.split(/[#&?/]/).some((p) => p.trim() === 'debug')) return true;
+            const q = String(location.search || '').toLowerCase();
+            if (/(?:^|[?&])debug(?:=|$|&)/.test(q)) return true;
+        } catch (_) { /* ignore */ }
+        return !!window.__MONITOR_DEBUG__;
+    }
+
+    function refreshDebugMode() {
+        const on = isDebugMode();
+        window.__MONITOR_DEBUG__ = on;
+        let banner = document.getElementById('monitorDebugBanner');
+        if (on) {
+            if (!banner && document.body) {
+                banner = document.createElement('div');
+                banner.id = 'monitorDebugBanner';
+                banner.className = 'debug-mode-banner';
+                banner.textContent = 'DEBUG StreamTitle — logs console actifs ([debug:StreamTitle] / [debug:ring] / [debug:play])';
+                document.body.insertBefore(banner, document.body.firstChild);
+            }
+            if (banner) banner.style.display = 'block';
+            console.info('%c[debug] StreamTitle logging ON', 'background:#00838f;color:#fff;padding:2px 8px;border-radius:3px');
+        } else if (banner) {
+            banner.style.display = 'none';
+        }
+        return on;
+    }
+
+    /** Logs StreamTitle / blank quand #debug est dans l'URL. */
+    function debugStreamTitleLog(event, details) {
+        if (!window.__MONITOR_DEBUG__ && !isDebugMode()) return;
+        window.__MONITOR_DEBUG__ = true;
+        const payload = Object.assign({ t: new Date().toISOString().slice(11, 23) }, details || {});
+        console.log(
+            '%c[debug:StreamTitle]%c ' + event,
+            'background:#00838f;color:#fff;padding:1px 6px;border-radius:3px',
+            'color:inherit',
+            payload
+        );
+    }
+
+    function createStreamPlayer(url, key) {
+        // IcecastMetadataPlayer utilise MSE audio/mpeg — non supporté sous Firefox.
+        if (!mseMpegSupported()) return null;
+        if (typeof IcecastMetadataPlayer === 'undefined') return null;
+        return new IcecastMetadataPlayer(url, {
+            ...ICECAST_PLAYER_OPTS,
+            onMetadata: (meta) => handleStreamMetadata(key, meta),
+            onError: (msg, err) => logStreamError(key, err || msg),
+            onRetryTimeout: () => logStreamError(key, 'retry timeout')
+        });
+    }
+
+    function isEnabled(entry) {
+        if (!entry) return false;
+        const rawId = String(entry.rawId);
+        if (entry.source === 'airband') return !disabledAirband.has(rawId);
+        return !disabledTetrapol.has(rawId);
+    }
+
+    /** Entrée éligible à une carte stream (activée, courante en scan, non chiffrée). */
+    function shouldMonitorEntry(entry) {
+        if (!entry || !entry.has_stream || !entry.streamUrl) return false;
+        if (isEncryptedEntry(entry)) return false;
+        if (!isEnabled(entry)) return false;
+        // Scan : une seule fréquence courante par canal — ignorer les autres.
+        if (entry.source === 'airband' && entry.meta && entry.meta.is_current === false) return false;
+        return true;
+    }
+
+    /** Clé catalogue qui doit lire ce streamUrl (fréquence courante + on_air + activée). */
+    function streamUrlOwnerKey(url) {
+        if (!url) return null;
+        if (mountBlockedByDisabledCurrent(url)) return null;
+
+        let owner = null;
+        let currentOwner = null;
+        catalog.forEach((entry) => {
+            if (entry.streamUrl !== url || !shouldMonitorEntry(entry) || !entry.on_air) return;
+            owner = entry.key;
+            if (entry.source === 'airband' && !(entry.meta && entry.meta.is_current === false)) {
+                currentOwner = entry.key;
+            }
+        });
+        return currentOwner || owner;
+    }
+
+    /** Mount airband dont la fréquence courante est on_air mais désactivée par l'utilisateur. */
+    function mountBlockedByDisabledCurrent(url) {
+        if (!url) return false;
+        let blocked = false;
+        catalog.forEach((entry) => {
+            if (entry.streamUrl !== url || !entry.on_air) return;
+            if (entry.source !== 'airband') return;
+            if (entry.meta && entry.meta.is_current === false) return;
+            if (!isEnabled(entry)) blocked = true;
+        });
+        return blocked;
+    }
+
+    function forEachCatalogKeyWithStreamUrl(url, fn) {
+        if (!url) return;
+        catalog.forEach((entry) => {
+            if (entry.streamUrl === url) fn(entry.key, entry);
+        });
+    }
+
+    function clearPendingForStreamUrl(url) {
+        forEachCatalogKeyWithStreamUrl(url, (key) => clearPendingCardStart(key));
+    }
+
+    /** Arrête la carte / file de cette entrée uniquement (pas tout le mount). */
+    function stopStreamMonitoring(entry) {
+        if (!entry) return;
+        clearPendingCardStart(entry.key);
+        if (players.has(entry.key) || isExclusiveSegmentKey(entry.key)) {
+            stopEntry(entry.key);
+        }
+        pruneStreamCardsByUrlOwner();
+    }
+
+    function getExclusiveSegment(key) {
+        if (!key) return null;
+        if (exclusiveActive?.key === key) return exclusiveActive;
+        return exclusiveQueue.find((s) => s.key === key) || null;
+    }
+
+    function pruneStreamCardsByUrlOwner() {
+        const keys = new Set([...players.keys()]);
+        exclusiveQueue.forEach((s) => keys.add(s.key));
+        if (exclusiveActive) keys.add(exclusiveActive.key);
+        keys.forEach((key) => {
+            const entry = catalog.get(key);
+            if (!entry?.streamUrl) return;
+            if (!isEnabled(entry)) {
+                stopEntry(key);
+                return;
+            }
+            const ownerKey = streamUrlOwnerKey(entry.streamUrl);
+            // Autre entrée légitime sur le même mount.
+            if (ownerKey && ownerKey !== key) {
+                stopEntry(key);
+                return;
+            }
+            // Courant désactivé : ne pas laisser une autre card lire ce mount.
+            if (!ownerKey && mountBlockedByDisabledCurrent(entry.streamUrl)) {
+                stopEntry(key);
+                return;
+            }
+            // ownerKey null (fin de com) : laisser finir le tampon.
+        });
+    }
+
+    function deriveTetrapolBases(wsUrl) {
+        // Kept for config display; browser no longer opens a remote WS/API.
+        void wsUrl;
+    }
+
+    /** Prefer same-origin /stream (proxy) unless browser-direct Icecast is enabled. */
+    function resolveIcecastUrl(mountPath) {
+        const mount = String(mountPath || '').replace(/^\//, '');
+        if (!mount) return null;
+        const base = String(icecastPublicBase || '').replace(/\/$/, '');
+        const port = String(location.port || (location.protocol === 'https:' ? '443' : '80'));
+        const viaReverseProxy = port === '80' || port === '443' || port === '';
+        // Direct Icecast needs CORS (Access-Control-Allow-Origin). Without it the
+        // metadata player fails with net::ERR_EMPTY_RESPONSE / CORS errors.
+        // Enable via ICECAST_BROWSER_DIRECT=1 or ?directStreams=1
+        const wantDirect = !!(window.__ICECAST_BROWSER_DIRECT__
+            || /(?:^|[?&#])directStreams=1(?:&|$|#)/.test(location.search + location.hash));
+        if (wantDirect && base && !viaReverseProxy) {
+            return base + '/' + mount;
+        }
+        return '/' + mount;
+    }
+
+    function buildAirbandUrl(ch) {
+        if (!ch || !ch.has_icecast || !ch.icecast_mountpoint) return null;
+        return resolveIcecastUrl(ch.icecast_mountpoint);
+    }
+
+    function buildTetrapolUrl(groupId) {
+        if (groupId == null || groupId === '') return null;
+        return resolveIcecastUrl('stream/' + groupId + '.mp3');
+    }
+
+    function catalogEntryFor(keyOrSeg) {
+        const key = typeof keyOrSeg === 'string'
+            ? keyOrSeg
+            : (keyOrSeg?.key || keyOrSeg?.entry?.key || '');
+        if (!key) return keyOrSeg?.entry || keyOrSeg || null;
+        return catalog.get(key) || keyOrSeg?.entry || null;
+    }
+
+    function labelOf(entry) {
+        const e = catalogEntryFor(entry) || entry;
+        if (!e) return '';
+        const direct = String(e.label || '').trim();
+        if (direct) return direct;
+        if (e.source === 'tetrapol') {
+            const gid = String(e.rawId || '').trim();
+            if (gid) {
+                const g = tetrapolGroups.get(gid);
+                const gl = String(g?.group_label || '').trim();
+                if (gl) return gl;
+                const ch = tetrapolChannels.find((c) => String(c.group_id || '') === gid);
+                const chl = String(ch?.group_label || '').trim();
+                if (chl) return chl;
+                return gid;
+            }
+        }
+        if (e.source === 'airband') {
+            const hz = e.meta?.freq_hz;
+            if (hz) return (hz / 1e6).toFixed(3) + ' MHz';
+        }
+        return String(e.rawId || '').trim();
+    }
+
+    function sourceLabel(entry) {
+        return entry && entry.source === 'tetrapol' ? '📻 Tetrapol' : '✈️ Analogique';
+    }
+
+    function freqLabel(entry) {
+        const hz = entry && entry.meta && entry.meta.freq_hz;
+        if (!hz) return '';
+        return (hz / 1e6).toFixed(3) + ' MHz';
+    }
+
+    function queueRoleLabel(seg, isActive) {
+        if (isActive) return '';
+        if (seg && seg.suspendedByUser) return 'pause';
+        return 'file';
+    }
+
+    function cardHeaderHtml(entry, txTitle) {
+        const src = sourceLabel(entry);
+        if (entry && entry.source === 'airband') {
+            const title = labelOf(entry);
+            const freq = freqLabel(entry);
+            return `<div class="stream-card-header stream-card-zone stream-card-zone-name">
+                <div class="stream-card-source">${src}</div>
+                <div class="stream-card-title">${title}</div>
+                ${freq ? `<div class="stream-card-subtitle">${freq}</div>` : ''}
+            </div>`;
+        }
+        const group = labelOf(entry);
+        const streamTitle = (txTitle || '').trim();
+        return `<div class="stream-card-header stream-card-zone stream-card-zone-name stream-card-header-tetrapol">
+            <div class="stream-card-source">${src}</div>
+            <div class="stream-card-title">${streamTitle || '\u00a0'}</div>
+            <div class="stream-card-subtitle stream-card-group-label">${group}</div>
+        </div>`;
+    }
+
+    function updateCardHeader(card, entry, opts = {}) {
+        entry = catalogEntryFor(entry) || entry;
+        if (!card || !entry) return;
+        let header = card.querySelector('.stream-card-header');
+        if (!header) {
+            const wrap = document.createElement('div');
+            wrap.innerHTML = cardHeaderHtml(entry, opts.txTitle || '');
+            header = wrap.firstElementChild;
+            const oldName = card.querySelector('.stream-name, .stream-card-zone-name');
+            if (oldName) oldName.replaceWith(header);
+            else card.insertBefore(header, card.firstChild);
+        }
+        const srcEl = header.querySelector('.stream-card-source');
+        const titleEl = header.querySelector('.stream-card-title');
+        const subEl = header.querySelector('.stream-card-subtitle');
+        const role = (opts.role || '').trim();
+        if (srcEl) {
+            srcEl.textContent = role ? `${sourceLabel(entry)} · ${role}` : sourceLabel(entry);
+        }
+        if (entry.source === 'airband') {
+            if (titleEl) titleEl.textContent = labelOf(entry);
+            const freq = freqLabel(entry);
+            if (freq) {
+                if (subEl) subEl.textContent = freq;
+                else {
+                    const s = document.createElement('div');
+                    s.className = 'stream-card-subtitle';
+                    s.textContent = freq;
+                    header.appendChild(s);
+                }
+            } else if (subEl) subEl.remove();
+        } else {
+            header.classList.add('stream-card-header-tetrapol');
+            const group = labelOf(entry);
+            const streamTitle = (opts.txTitle || '').trim();
+            if (titleEl) titleEl.textContent = streamTitle || '\u00a0';
+            if (subEl) {
+                subEl.textContent = group;
+                subEl.classList.add('stream-card-group-label');
+            } else {
+                const s = document.createElement('div');
+                s.className = 'stream-card-subtitle stream-card-group-label';
+                s.textContent = group;
+                header.appendChild(s);
+            }
+        }
+    }
+
+    function isEncryptedEntry(entry) {
+        if (!entry) return false;
+        if (entry.encrypted) return true;
+        const m = entry.meta || {};
+        if (m.encrypted) return true;
+        if (entry.source === 'tetrapol') {
+            return tetrapolChannels.some(c =>
+                String(c.group_id) === String(entry.rawId) && !!c.encrypted);
+        }
+        return false;
+    }
+
+    async function apiPulseToggle(streamId, listen) {
+        try {
+            await fetch('/api/airband/toggle?group=' + encodeURIComponent(streamId) + '&listen=' + (listen ? 'true' : 'false'), { method: 'POST' });
+        } catch (e) { console.warn(e); }
+    }
+
+    async function apiTetrapolToggle(groupId, listen) {
+        // Proxied through Airband → remote Tetrapol mixer (no browser CORS)
+        try {
+            await fetch('/api/tetrapol/toggle?group=' + encodeURIComponent(groupId) + '&listen=' + (listen ? 'true' : 'false'), {
+                method: 'POST'
+            });
+        } catch (e) {
+            console.warn('tetrapol toggle', e);
+        }
+    }
+
+    async function apiPulseExclusive(payload) {
+        try {
+            const r = await fetch('/api/airband/pulse-exclusive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const text = await r.text();
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                console.warn('pulse-exclusive failed', e, text.slice(0, 200));
+                return null;
+            }
+        } catch (e) {
+            console.warn('pulse-exclusive failed', e);
+            return null;
+        }
+    }
+
+    async function apiTetrapolPulseExclusive(payload) {
+        try {
+            const r = await fetch('/api/tetrapol/pulse-exclusive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!r.ok) console.warn('tetrapol pulse-exclusive HTTP', r.status);
+            const text = await r.text();
+            try {
+                return text ? JSON.parse(text) : null;
+            } catch (_) {
+                return null;
+            }
+        } catch (e) {
+            console.warn('tetrapol pulse-exclusive failed', e);
+            return null;
+        }
+    }
+
+    async function apiPulseArbiter(path, payload) {
+        try {
+            const r = await fetch('/api/pulse/' + path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload || {})
+            });
+            const text = await r.text();
+            try {
+                return text ? JSON.parse(text) : null;
+            } catch (_) {
+                return null;
+            }
+        } catch (e) {
+            console.warn('pulse arbiter', path, e);
+            return null;
+        }
+    }
+
+    function resolvePulseSource(gid) {
+        const id = String(gid || '');
+        if (catalog.get(airKey(id))) return 'airband';
+        if (catalog.get(tpKey(id))) return 'tetrapol';
+        if ((pulseExclusiveState.listen_groups || []).some((g) => String(g.group_id) === id))
+            return 'airband';
+        if ((tpPulseExclusiveState.listen_groups || []).some((g) => String(g.group_id) === id))
+            return 'tetrapol';
+        return 'airband';
+    }
+
+    function cssEscapeAttr(value) {
+        const s = String(value);
+        if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+        return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    /** Pulse exclusive / force must hit both controllers (shared audio behaviour). */
+    async function apiPulseExclusiveBoth(payload) {
+        const [ab] = await Promise.all([
+            apiPulseExclusive(payload),
+            apiTetrapolPulseExclusive(payload),
+        ]);
+        return ab;
+    }
+
+    function rebuildCatalog() {
+        catalog.clear();
+        airbandById.forEach((ch, id) => {
+            const url = buildAirbandUrl(ch);
+            catalog.set(airKey(id), {
+                key: airKey(id),
+                source: 'airband',
+                rawId: id,
+                label: ch.label || ((ch.freq_hz / 1e6).toFixed(3) + ' MHz'),
+                on_air: !!ch.on_air,
+                has_stream: !!url,
+                streamUrl: url,
+                priority: isStreamPriority(airKey(id)) || !!ch.priority,
+                meta: ch
+            });
+        });
+        tetrapolGroups.forEach((g, gid) => {
+            const url = buildTetrapolUrl(gid);
+            let onAir = !!g.on_air;
+            let encrypted = !!g.encrypted;
+            tetrapolChannels.forEach(c => {
+                if (String(c.group_id) === String(gid)) {
+                    if (c.on_air) onAir = true;
+                    if (c.encrypted) encrypted = true;
+                }
+            });
+            catalog.set(tpKey(gid), {
+                key: tpKey(gid),
+                source: 'tetrapol',
+                rawId: String(gid),
+                label: g.group_label || String(gid),
+                on_air: onAir,
+                encrypted,
+                has_stream: !!url && !encrypted,
+                streamUrl: encrypted ? null : url,
+                priority: isStreamPriority(tpKey(gid)),
+                meta: Object.assign({}, g, { listen: g.listen !== false, encrypted })
+            });
+        });
+    }
+
+    /* ---- Réception : cellules Tetrapol + devices Analogique ---- */
+
+    function normalizeCellSyncStatus(status, syncErrs) {
+        const s = String(status || '').toLowerCase();
+        if (s === 'synced' || s === 'ok' || s === 'sync') return 'synced';
+        if (s === 'unsynced' || s === 'timeout' || s === 'unknown') return 'unsynced';
+        if (s === 'lost' || s === 'error' || s === 'nosync') return 'lost';
+        if (!s && syncErrs > 0) return 'lost';
+        if (!s) return 'unsynced';
+        return s;
+    }
+
+    function markAllCellsUnsynced(reason) {
+        let changed = false;
+        tetrapolCells.forEach((cell) => {
+            if (cell.syncStatus !== 'unsynced' && cell.syncStatus !== 'lost') {
+                cell.syncStatus = 'unsynced';
+                changed = true;
+            }
+        });
+        if (changed) {
+            lastReceptionSig = '';
+            updateReceptionDisplay();
+        }
+        return changed;
+    }
+
+    function applyTetrapolCellsSnapshot(list) {
+        if (!Array.isArray(list)) return;
+        if (!list.length) return; // keep last-known cells; timeout / disconnect mark them KO
+        const next = new Map();
+        const now = Date.now();
+        list.forEach((raw) => {
+            const channelId = Number(raw.channel_id);
+            if (!Number.isFinite(channelId) || channelId <= 0) return;
+            const prev = tetrapolCells.get(channelId);
+            const syncErrs = Number(raw.sync_errs) || 0;
+            let syncStatus = normalizeCellSyncStatus(raw.sync_status, syncErrs);
+            const rawLast = Number(raw.last_cell_info_ms) || 0;
+            // Never refresh freshness from "now" on snapshot — that defeats the 25s timeout.
+            let lastCellInfoTime = rawLast || (prev && prev.lastCellInfoTime) || 0;
+            if (prev && prev.syncStatus === 'unsynced' && syncStatus === 'synced') {
+                const age = lastCellInfoTime ? (now - lastCellInfoTime) : CELL_INFO_TIMEOUT_MS + 1;
+                if (age > CELL_INFO_TIMEOUT_MS) syncStatus = 'unsynced';
+            }
+            if (lastCellInfoTime && (now - lastCellInfoTime) > CELL_INFO_TIMEOUT_MS
+                && syncStatus !== 'lost') {
+                syncStatus = 'unsynced';
+            }
+            next.set(channelId, {
+                channelId,
+                cellId: String(raw.cell_id || (prev && prev.cellId) || channelId),
+                countryCode: raw.country_code != null ? Number(raw.country_code) : (prev ? prev.countryCode : null),
+                bnId: raw.bn_id != null ? Number(raw.bn_id) : (prev ? prev.bnId : null),
+                syncStatus,
+                syncErrs,
+                lastCellInfoTime
+            });
+        });
+        // Preserve cells missing from this snapshot (still subject to timeout).
+        tetrapolCells.forEach((prev, id) => {
+            if (!next.has(id)) next.set(id, prev);
+        });
+        tetrapolCells = next;
+        if (list.length) lastTetrapolCellFeedMs = now;
+    }
+
+    function handleTetrapolCellEvent(msg) {
+        if (!msg || !msg.event) return false;
+        if (msg.event === 'cell_info') {
+            const channelId = Number(msg.channel_id);
+            if (!Number.isFinite(channelId) || channelId <= 0) return true;
+            let cell = tetrapolCells.get(channelId);
+            if (!cell) {
+                cell = { channelId, syncStatus: 'unknown', syncErrs: 0, lastCellInfoTime: null };
+                tetrapolCells.set(channelId, cell);
+            }
+            cell.lastCellInfoTime = Date.now();
+            lastTetrapolCellFeedMs = cell.lastCellInfoTime;
+            if (cell.syncStatus === 'unsynced' || cell.syncStatus === 'unknown')
+                cell.syncStatus = 'synced';
+            cell.countryCode = msg.country_code != null ? Number(msg.country_code) : cell.countryCode;
+            cell.bnId = msg.bn_id != null ? Number(msg.bn_id) : cell.bnId;
+            cell.cellId = msg.cell_id != null ? String(msg.cell_id) : cell.cellId;
+            lastReceptionSig = '';
+            updateReceptionDisplay();
+            return true;
+        }
+        if (msg.event === 'cch_sync') {
+            const channelId = Number(msg.channel_id);
+            if (!Number.isFinite(channelId) || channelId <= 0) return true;
+            let cell = tetrapolCells.get(channelId);
+            if (!cell) {
+                cell = { channelId, syncStatus: 'unknown', syncErrs: 0, lastCellInfoTime: Date.now() };
+                tetrapolCells.set(channelId, cell);
+            }
+            const syncErrs = Number(msg.sync_errs) || 0;
+            // cch_sync does not refresh cell_info freshness (same as tetrapol-kit).
+            if (cell.syncStatus !== 'unsynced') {
+                cell.syncStatus = normalizeCellSyncStatus(msg.status, syncErrs);
+            }
+            cell.syncErrs = syncErrs;
+            lastReceptionSig = '';
+            updateReceptionDisplay();
+            return true;
+        }
+        return false;
+    }
+
+    function checkCellInfoTimeouts() {
+        const now = Date.now();
+        let changed = false;
+
+        // No Tetrapol feed at all (link down / silence) → all cells KO.
+        if (tetrapolCells.size && lastTetrapolCellFeedMs
+            && (now - lastTetrapolCellFeedMs) > CELL_INFO_TIMEOUT_MS) {
+            tetrapolCells.forEach((cell) => {
+                if (cell.syncStatus !== 'unsynced' && cell.syncStatus !== 'lost') {
+                    cell.syncStatus = 'unsynced';
+                    changed = true;
+                }
+            });
+        }
+
+        tetrapolCells.forEach((cell) => {
+            if (!cell.lastCellInfoTime) {
+                // First sight without timestamp: start the clock, don't treat as fresh forever.
+                cell.lastCellInfoTime = lastTetrapolCellFeedMs || now;
+                return;
+            }
+            if ((now - cell.lastCellInfoTime) > CELL_INFO_TIMEOUT_MS) {
+                if (cell.syncStatus !== 'unsynced' && cell.syncStatus !== 'lost') {
+                    cell.syncStatus = 'unsynced';
+                    changed = true;
+                }
+            }
+        });
+        if (!tetrapolBridged && tetrapolCells.size) {
+            tetrapolCells.forEach((cell) => {
+                if (cell.syncStatus !== 'unsynced' && cell.syncStatus !== 'lost') {
+                    cell.syncStatus = 'unsynced';
+                    changed = true;
+                }
+            });
+        }
+        if (changed) {
+            lastReceptionSig = '';
+            updateReceptionDisplay();
+        }
+    }
+
+    function buildTetrapolCellCards() {
+        if (tetrapolCells.size > 0) {
+            return [...tetrapolCells.values()].sort((a, b) => a.channelId - b.channelId);
+        }
+        // Fallback only while bridged and waiting for first cell_info.
+        if (!tetrapolBridged) return [];
+        const byCell = new Map();
+        tetrapolChannels.forEach((c) => {
+            const cellId = c.is_dir ? 'DIR' : String(c.cell_id || '').trim();
+            if (!cellId || cellId === '-' || cellId === 'null') return;
+            if (!byCell.has(cellId)) {
+                byCell.set(cellId, {
+                    channelId: Number(c.channel_id) || 0,
+                    cellId,
+                    countryCode: null,
+                    bnId: null,
+                    syncStatus: 'unsynced',
+                    syncErrs: 0,
+                    lastCellInfoTime: lastTetrapolCellFeedMs || 0,
+                    _fallback: true
+                });
+            }
+        });
+        return [...byCell.values()].sort((a, b) => String(a.cellId).localeCompare(String(b.cellId)));
+    }
+
+    function buildAnalogDeviceCards() {
+        if (!airbandBridged) return [];
+        const byDev = new Map();
+        [...airbandById.values()].forEach((ch) => {
+            const d = ch.device;
+            if (d == null) return;
+            if (!byDev.has(d)) {
+                byDev.set(d, {
+                    device: d,
+                    total: 0,
+                    listened: 0,
+                    onAir: 0,
+                    modes: new Set()
+                });
+            }
+            const info = byDev.get(d);
+            info.total += 1;
+            const entry = catalog.get(airKey(ch.stream_id));
+            if (entry ? isEnabled(entry) : !disabledAirband.has(ch.stream_id)) {
+                info.listened += 1;
+            }
+            if (ch.on_air) info.onAir += 1;
+            if (ch.modulation) info.modes.add(String(ch.modulation).toUpperCase());
+        });
+        return [...byDev.values()].sort((a, b) => a.device - b.device);
+    }
+
+    function receptionSyncClass(kind, item) {
+        if (kind === 'cell') {
+            return normalizeCellSyncStatus(item.syncStatus, item.syncErrs);
+        }
+        if (item.onAir > 0) return 'synced';
+        if (item.listened > 0) return 'synced';
+        return 'lost';
+    }
+
+    function receptionStatusText(kind, item, sync) {
+        if (kind === 'cell') {
+            if (sync === 'unsynced') return 'Non synchronisé';
+            if (sync === 'synced') return 'Synchronisé';
+            if (sync === 'unknown') return 'En attente';
+            return 'Perte de sync';
+        }
+        if (item.onAir > 0) return 'En réception';
+        if (item.listened > 0) return 'Écoute active';
+        return 'Aucune fréquence activée';
+    }
+
+    function updateReceptionDisplay() {
+        if (!el.receptionContainer) return;
+        const cells = buildTetrapolCellCards();
+        const devices = buildAnalogDeviceCards();
+        const sig = JSON.stringify({
+            c: cells.map(c => [c.channelId, c.cellId, c.syncStatus, c.syncErrs, c.countryCode, c.bnId]),
+            d: devices.map(d => [d.device, d.listened, d.total, d.onAir])
+        });
+        if (sig === lastReceptionSig) return;
+        lastReceptionSig = sig;
+
+        if (!cells.length && !devices.length) {
+            el.receptionContainer.innerHTML = '<div class="no-data">Aucune réception détectée</div>';
+            return;
+        }
+
+        const parts = [];
+        devices.forEach((dev) => {
+            const sync = receptionSyncClass('device', dev);
+            const status = receptionStatusText('device', dev, sync);
+            const modes = [...dev.modes].join(' / ') || '—';
+            parts.push(`
+                <div class="cell-card ${sync}" data-kind="analog" data-device="${dev.device}">
+                    <div class="cell-name">✈️ Device ${dev.device}</div>
+                    <div class="cell-info">${dev.listened} fréquence${dev.listened > 1 ? 's' : ''} écoutée${dev.listened > 1 ? 's' : ''}
+                        <span style="opacity:.75"> / ${dev.total} configurée${dev.total > 1 ? 's' : ''}</span>
+                    </div>
+                    <div class="cell-info">Mode : ${modes}</div>
+                    <div class="cell-sync-status">
+                        <span class="sync-indicator ${sync}"></span>
+                        <span>${status}</span>
+                        ${dev.onAir ? `<span>(${dev.onAir} ON AIR)</span>` : ''}
+                    </div>
+                </div>`);
+        });
+        cells.forEach((cell) => {
+            const sync = receptionSyncClass('cell', cell);
+            const status = receptionStatusText('cell', cell, sync);
+            const countryName = getCountryName(cell.countryCode);
+            const deptName = getDepartmentName(cell.bnId);
+            const cellLabel = cell.cellId || String(cell.channelId);
+            const title = `${countryName} - ${deptName} - ${cellLabel}`;
+            parts.push(`
+                <div class="cell-card ${sync}" data-kind="tetrapol" data-channel="${cell.channelId}">
+                    <div class="cell-name">${escHtml(title)}</div>
+                    <div class="cell-info">Channel: ${cell.channelId}</div>
+                    <div class="cell-sync-status">
+                        <span class="sync-indicator ${sync}"></span>
+                        <span>${status}</span>
+                        ${cell.syncErrs != null ? `<span>(${cell.syncErrs} erreur${cell.syncErrs > 1 ? 's' : ''})</span>` : ''}
+                    </div>
+                </div>`);
+        });
+        el.receptionContainer.innerHTML = parts.join('');
+    }
+
+    function getCountryName(countryCode) {
+        if (countryCode == null || countryCode < 0) return 'Pays inconnu';
+        return countriesMap[String(countryCode)] || 'Pays inconnu';
+    }
+
+    function getDepartmentName(bnId) {
+        if (bnId == null || bnId < 0) return 'Département inconnu';
+        return departmentsMap[String(bnId)] || 'Département inconnu';
+    }
+
+    async function loadDepartments() {
+        try {
+            const r = await fetch('/departments.json');
+            const data = await r.json();
+            departmentsMap = data.departments || {};
+            countriesMap = data.countries || {};
+            lastReceptionSig = '';
+            updateReceptionDisplay();
+        } catch (e) {
+            console.warn('departments.json', e);
+        }
+    }
+
+    /* ---- Listings (stable) ---- */
+
+    function trackAirbandInactive(ch) {
+        const id = String(ch.stream_id || '');
+        if (!id) return;
+        const key = 'ab:' + id;
+        const onAir = !!ch.on_air;
+        if (channelWasOnAir[key] && !onAir && !(ch.last_close_ms > 0)) {
+            channelInactiveSince[key] = Date.now();
+        }
+        if (onAir) delete channelInactiveSince[key];
+        channelWasOnAir[key] = onAir;
+    }
+
+    function getAirbandInactiveSince(ch) {
+        // Prefer server squelch-close timestamp; else local edge tracking.
+        if (ch.last_close_ms > 0) return ch.last_close_ms;
+        const id = String(ch.stream_id || '');
+        return channelInactiveSince['ab:' + id] || null;
+    }
+
+    function getAirbandStatusText(ch) {
+        if (ch.on_air) return 'En cours';
+        const since = getAirbandInactiveSince(ch);
+        if (!since) return 'Inactif';
+        return formatChannelInactiveStatus(Math.max(0, Date.now() - since)) || 'Inactif';
+    }
+
+    function updateAirbandTable(channels) {
+        if (!el.channelsTableBody) return;
+        channels.forEach(trackAirbandInactive);
+        const statuses = channels.map(ch => getAirbandStatusText(ch));
+        const sig = channels.map((c, i) => [
+            c.stream_id, c.on_air ? 1 : 0, c.label || '', c.modulation || '',
+            c.last_close_ms || 0, statuses[i]
+        ].join(':')).join('|');
+        if (sig === lastAirSig) return;
+        lastAirSig = sig;
+        ensureInactiveRefreshTimer();
+        if (!channels.length) {
+            el.channelsTableBody.innerHTML = airbandBridged
+                ? '<tr><td colspan="6" class="no-data">Aucune fréquence</td></tr>'
+                : '<tr><td colspan="6" class="no-data">Analogique déconnecté</td></tr>';
+            return;
+        }
+        el.channelsTableBody.innerHTML = channels.map((ch, i) => `<tr>
+            <td data-label="Device">${ch.device}</td>
+            <td data-label="Canal">${ch.channel}</td>
+            <td data-label="Fréquence">${(ch.freq_hz / 1e6).toFixed(3)}</td>
+            <td data-label="Mode">${ch.modulation || ''}</td>
+            <td data-label="Label">${ch.label || ''}</td>
+            <td data-label="État"><span class="status-indicator ${ch.on_air ? 'on-air' : 'off-air'}"></span>${statuses[i]}</td>
+        </tr>`).join('');
+    }
+
+    function isStreamPriority(key) {
+        return priorityKeys.has(key);
+    }
+
+    function isPulsePriority(key) {
+        return pulsePriorityKeys.has(key);
+    }
+
+    function toggleStreamPriority(key) {
+        if (priorityKeys.has(key)) priorityKeys.delete(key);
+        else priorityKeys.add(key);
+        saveDisabled();
+        const entry = catalog.get(key);
+        if (entry) entry.priority = priorityKeys.has(key);
+        exclusiveQueue.forEach(s => {
+            if (s.key === key && s.entry) s.entry.priority = priorityKeys.has(key);
+        });
+        if (exclusiveActive && exclusiveActive.key === key && exclusiveActive.entry) {
+            exclusiveActive.entry.priority = priorityKeys.has(key);
+        }
+        lastAirBtnSig = '';
+        lastTpSig = '';
+        updateAirbandButtons();
+        updateTetrapolListing();
+        if (exclusivePlaybackMode) refreshExclusiveCards();
+    }
+
+    async function togglePulsePriority(key) {
+        const enabling = !pulsePriorityKeys.has(key);
+        if (enabling) pulsePriorityKeys.add(key);
+        else pulsePriorityKeys.delete(key);
+        saveDisabled();
+        const entry = catalog.get(key);
+        lastPulseSig = '';
+        // Prio indépendante de listen : ne pas activer/désactiver le canal.
+        if (entry && entry.source === 'airband') {
+            await apiPulseExclusive({
+                priority_group: entry.rawId,
+                priority: enabling
+            });
+            if (entry.meta) entry.meta.priority = enabling;
+            const ch = airbandById.get(entry.rawId);
+            if (ch) ch.priority = enabling;
+        } else if (entry && entry.source === 'tetrapol') {
+            tpPulsePrioLocalUntil = Date.now() + 1500;
+            await syncTetrapolPulsePriorities();
+        }
+        rebuildCatalog();
+        updatePulseAdmin(pulseExclusiveState);
+    }
+
+    async function syncTetrapolPulsePriorities() {
+        const ids = [...pulsePriorityKeys]
+            .filter((k) => k.startsWith('tp:'))
+            .map((k) => k.slice(3));
+        try {
+            await fetch('/api/tetrapol/pulse-exclusive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ priority_groups: ids })
+            });
+        } catch (e) {
+            console.warn('tetrapol pulse priority sync', e);
+        }
+    }
+
+    /** Apply priority_groups from Airband pulse_exclusive onto local ab: keys. */
+    function applyAirbandPulsePriorities(pe) {
+        if (!pe || typeof pe !== 'object') return false;
+        const server = new Set();
+        if (Array.isArray(pe.priority_groups)) {
+            pe.priority_groups.forEach((id) => server.add(String(id)));
+        }
+        (pe.listen_groups || []).forEach((g) => {
+            if (g && g.priority === true && g.group_id != null) server.add(String(g.group_id));
+        });
+        // Sans priority_groups ni listen_groups, ne pas effacer l'état local.
+        if (!Array.isArray(pe.priority_groups) && !Array.isArray(pe.listen_groups)) return false;
+        let changed = false;
+        [...pulsePriorityKeys].forEach((k) => {
+            if (!k.startsWith('ab:')) return;
+            const id = k.slice(3);
+            if (!server.has(id)) {
+                pulsePriorityKeys.delete(k);
+                changed = true;
+            }
+        });
+        server.forEach((id) => {
+            const k = airKey(id);
+            if (!pulsePriorityKeys.has(k)) {
+                pulsePriorityKeys.add(k);
+                changed = true;
+            }
+        });
+        if (changed) saveDisabled();
+        return changed;
+    }
+
+    /** Apply priority_groups from Tetrapol pulse_exclusive onto local tp: keys. */
+    function applyTetrapolPulsePriorities(pe) {
+        if (!pe || typeof pe !== 'object' || !Array.isArray(pe.priority_groups)) return;
+        if (Date.now() < tpPulsePrioLocalUntil) return;
+        const server = new Set(pe.priority_groups.map(String));
+        let changed = false;
+        [...pulsePriorityKeys].forEach((k) => {
+            if (!k.startsWith('tp:')) return;
+            const gid = k.slice(3);
+            if (!server.has(gid)) {
+                pulsePriorityKeys.delete(k);
+                changed = true;
+            }
+        });
+        server.forEach((gid) => {
+            const k = tpKey(gid);
+            if (!pulsePriorityKeys.has(k)) {
+                pulsePriorityKeys.add(k);
+                changed = true;
+            }
+        });
+        if (!changed) return;
+        saveDisabled();
+        lastPulseSig = '';
+        lastTpSig = '';
+        updateTetrapolListing();
+    }
+
+    function bindLongPressPriority(btn, onTogglePriority, onShortClick) {
+        let pressStartTime = 0;
+        let pressStartPos = null;
+        let longPressFired = false;
+        let longPressTimer = null;
+        let lastPriorityToggleAt = 0;
+        let lastTouchGestureAt = 0;
+
+        const resetTouchPress = () => {
+            pressStartTime = 0;
+            pressStartPos = null;
+            if (longPressTimer) {
+                clearTimeout(longPressTimer);
+                longPressTimer = null;
+            }
+        };
+
+        const fireLongPress = () => {
+            if (longPressFired || !pressStartTime) return;
+            longPressFired = true;
+            longPressTimer = null;
+            lastPriorityToggleAt = Date.now();
+            window.getSelection()?.removeAllRanges();
+            try {
+                onTogglePriority();
+            } catch (err) {
+                console.warn('priority toggle', err);
+            }
+            try {
+                if (navigator.vibrate) navigator.vibrate(50);
+            } catch (_) { /* ignore */ }
+        };
+
+        // Desktop: right-click / long-press context menu → priority
+        btn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (Date.now() - lastPriorityToggleAt < GESTURE_GUARD_MS) return;
+            lastPriorityToggleAt = Date.now();
+            try {
+                onTogglePriority();
+            } catch (err) {
+                console.warn('priority toggle', err);
+            }
+        });
+
+        // Desktop mouse: normal click → enable/disable (must not be blocked by touch guards)
+        btn.addEventListener('click', (e) => {
+            if (Date.now() - lastTouchGestureAt < GESTURE_GUARD_MS) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            if (Date.now() - lastPriorityToggleAt < GESTURE_GUARD_MS) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            try {
+                onShortClick(e);
+            } catch (err) {
+                console.warn('short click', err);
+            }
+        });
+
+        // Mobile: touch long-press → priority, short tap → enable/disable
+        btn.addEventListener('touchstart', (e) => {
+            if (!e.touches || !e.touches[0]) return;
+            pressStartTime = Date.now();
+            pressStartPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            longPressFired = false;
+            if (longPressTimer) clearTimeout(longPressTimer);
+            longPressTimer = setTimeout(fireLongPress, LONG_PRESS_MS);
+        }, { passive: true });
+
+        btn.addEventListener('touchmove', (e) => {
+            if (!pressStartPos || !e.touches || !e.touches[0]) return;
+            const dx = e.touches[0].clientX - pressStartPos.x;
+            const dy = e.touches[0].clientY - pressStartPos.y;
+            if ((dx * dx + dy * dy) > MOVE_TOLERANCE * MOVE_TOLERANCE) {
+                resetTouchPress();
+                longPressFired = false;
+            }
+        }, { passive: true });
+
+        btn.addEventListener('touchend', (e) => {
+            const duration = pressStartTime ? Date.now() - pressStartTime : 0;
+            const started = !!pressStartTime;
+            lastTouchGestureAt = Date.now();
+            if (longPressFired || duration >= LONG_PRESS_MS) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!longPressFired) fireLongPress();
+            } else if (started) {
+                e.preventDefault();
+                e.stopPropagation();
+                try {
+                    onShortClick(e);
+                } catch (err) {
+                    console.warn('short click', err);
+                }
+            }
+            resetTouchPress();
+            longPressFired = false;
+        }, { passive: false });
+
+        btn.addEventListener('touchcancel', () => {
+            resetTouchPress();
+            longPressFired = false;
+        });
+    }
+
+    /* ---- Tetrapol channel table rules (from tetrapol-kit) ---- */
+
+    function trackChannelInactive(channel) {
+        const id = String(channel.channel_id || '');
+        if (!id) return;
+        const onAir = !!channel.on_air;
+        if (channelWasOnAir[id] && !onAir && !channel.inactive_since_ms && !channel.last_active_ms) {
+            channelInactiveSince[id] = Date.now();
+        }
+        if (onAir) delete channelInactiveSince[id];
+        channelWasOnAir[id] = onAir;
+    }
+
+    function getChannelInactiveSince(channel) {
+        if (channel.inactive_since_ms > 0) return channel.inactive_since_ms;
+        if (channel.last_active_ms > 0) return channel.last_active_ms;
+        return channelInactiveSince[String(channel.channel_id)] || null;
+    }
+
+    function getChannelHideSince(channel) {
+        if (channel.on_air) return null;
+        if (channel.tch_connected !== true) {
+            return (channel.tch_disconnected_since_ms > 0 ? channel.tch_disconnected_since_ms : null)
+                || getChannelInactiveSince(channel)
+                || null;
+        }
+        return getChannelInactiveSince(channel) || null;
+    }
+
+    function getChannelHideLimitMs(channel) {
+        return channel.tch_connected === true ? CHANNEL_INACTIVE_HIDE_MS : CHANNEL_NOT_CONNECTED_HIDE_MS;
+    }
+
+    function shouldDisplayChannelInTable(channel) {
+        if (channel.on_air) return true;
+        const hideSince = getChannelHideSince(channel);
+        if (!hideSince) return true;
+        return (Date.now() - hideSince) < getChannelHideLimitMs(channel);
+    }
+
+    function formatChannelInactiveStatus(elapsedMs) {
+        const oneMinute = 60000;
+        const oneHour = 60 * oneMinute;
+        const oneDay = 24 * oneHour;
+        if (elapsedMs < oneMinute) return 'Inactif';
+        if (elapsedMs < oneHour) return `Inactif depuis ${Math.floor(elapsedMs / oneMinute)} min`;
+        if (elapsedMs < oneDay) {
+            const hours = Math.floor(elapsedMs / oneHour);
+            return hours === 1 ? 'Inactif >1 heure' : `Inactif >${hours} heures`;
+        }
+        if (elapsedMs < CHANNEL_INACTIVE_HIDE_MS) return 'Inactif >1 jour';
+        return 'Inactif';
+    }
+
+    function getChannelStatusText(channel) {
+        if (channel.on_air) return 'En cours';
+        const since = getChannelInactiveSince(channel);
+        if (!since) return 'Inactif';
+        return formatChannelInactiveStatus(Math.max(0, Date.now() - since)) || 'Inactif';
+    }
+
+    function ensureInactiveRefreshTimer() {
+        if (inactiveRefreshTimer) return;
+        inactiveRefreshTimer = setInterval(() => {
+            lastTpSig = '';
+            lastAirSig = '';
+            updateTetrapolListing();
+            updateAirbandTable([...airbandById.values()]);
+        }, 60000);
+    }
+
+    function syncButtonGrid(container, entries, kind) {
+        if (!container) return;
+        const wanted = new Set(entries.map(e => e.key));
+        [...container.querySelectorAll('.group-btn')].forEach(btn => {
+            if (!wanted.has(btn.dataset.key)) btn.remove();
+        });
+        // Re-append in entries order so sort (group number, etc.) is reflected in the DOM.
+        entries.forEach(entry => {
+            let btn = container.querySelector('.group-btn[data-key="' + esc(entry.key) + '"]');
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'group-btn';
+                btn.dataset.key = entry.key;
+                btn.dataset.kind = kind;
+                const span = document.createElement('span');
+                span.className = 'group-btn-label';
+                btn.appendChild(span);
+                bindLongPressPriority(
+                    btn,
+                    () => toggleStreamPriority(entry.key),
+                    () => toggleMonitoring(entry.key)
+                );
+            }
+            container.appendChild(btn);
+            const prio = isStreamPriority(entry.key);
+            btn.classList.toggle('enabled', isEnabled(entry));
+            btn.classList.toggle('on-air', !!entry.on_air);
+            btn.classList.toggle('priority', prio);
+            const span = btn.querySelector('.group-btn-label');
+            if (span) {
+                const prefix = entry.source === 'tetrapol' ? '📻 ' : '✈️ ';
+                span.textContent = prefix + labelOf(entry);
+            }
+            btn.title = prio
+                ? 'Priorité file stream — clic droit / appui long pour retirer'
+                : 'Stream · ' + entry.key + (entry.streamUrl ? '\n' + entry.streamUrl : '');
+        });
+    }
+
+    function sortEntriesByGroupNumber(entries) {
+        return [...entries].sort((a, b) => {
+            const numA = parseInt(a.rawId, 10);
+            const numB = parseInt(b.rawId, 10);
+            if (Number.isFinite(numA) && Number.isFinite(numB) && numA !== numB) return numA - numB;
+            return String(a.rawId).localeCompare(String(b.rawId), undefined, { numeric: true });
+        });
+    }
+
+    function updateAirbandButtons() {
+        if (isAdminPage) {
+            if (el.groupButtons) el.groupButtons.innerHTML = '';
+            return;
+        }
+        if (!audioEnabled) {
+            if (el.groupButtonsSection) el.groupButtonsSection.style.display = 'none';
+            if (el.groupButtons) el.groupButtons.innerHTML = '';
+            lastAirBtnSig = '';
+            return;
+        }
+        if (el.groupButtonsSection) el.groupButtonsSection.style.display = '';
+        const entries = [...catalog.values()].filter(e => e.source === 'airband');
+        const sorted = sortEntriesByGroupNumber(entries);
+        const sig = sorted.map(e => [
+            e.key, isEnabled(e) ? 1 : 0, e.on_air ? 1 : 0,
+            isStreamPriority(e.key) ? 1 : 0, e.label
+        ].join(':')).join('|');
+        if (sig === lastAirBtnSig) return;
+        lastAirBtnSig = sig;
+        syncButtonGrid(el.groupButtons, sorted, 'airband');
+    }
+
+    function updateTetrapolListing() {
+        const visible = tetrapolChannels.filter(c => {
+            trackChannelInactive(c);
+            return shouldDisplayChannelInTable(c);
+        });
+        const sig = JSON.stringify({
+            c: visible.map(c => [
+                c.channel_id, c.group_id, c.on_air ? 1 : 0, c.rfsi || '',
+                c.tch_connected === false ? 0 : 1, c.encrypted ? 1 : 0,
+                getChannelStatusText(c)
+            ]),
+            g: [...tetrapolGroups.values()].map(g => [
+                g.group_id, g.on_air ? 1 : 0, g.group_label || '',
+                isStreamPriority(tpKey(g.group_id)) ? 1 : 0
+            ])
+        });
+        if (sig === lastTpSig) return;
+        lastTpSig = sig;
+        ensureInactiveRefreshTimer();
+
+        if (el.tetrapolBody) {
+            if (!visible.length) {
+                el.tetrapolBody.innerHTML = '<tr class="no-data-row"><td colspan="7" class="no-data">'
+                    + (tetrapolChannels.length ? 'Aucune transmission récente' : 'Aucune transmission')
+                    + '</td></tr>';
+            } else {
+                el.tetrapolBody.innerHTML = visible.map(c => {
+                    const encrypted = !!c.encrypted;
+                    const encIcon = encrypted ? '🔒' : '🔓';
+                    const encClass = encrypted ? 'encrypted' : 'clear';
+                    const cellId = c.is_dir ? 'DIR' : (c.cell_id || '-');
+                    const rowClass = (c.tch_connected === false) ? ' class="channel-not-connected"' : '';
+                    const status = getChannelStatusText(c);
+                    return `<tr${rowClass}>
+                        <td data-label="Cellule">${cellId}</td>
+                        <td data-label="Channel">${c.channel_id || '-'}</td>
+                        <td data-label="Group"><div class="group-id-cell">
+                            <span class="encryption-icon ${encClass}">${encIcon}</span>
+                            <span>${c.group_id || '-'}</span>
+                        </div></td>
+                        <td data-label="Label">${c.group_label || '-'}</td>
+                        <td data-label="RFSI">${c.rfsi || '-'}</td>
+                        <td data-label="RFSI Label">${c.rfsi_label || '-'}</td>
+                        <td data-label="État"><span class="status-indicator ${c.on_air ? 'on-air' : 'off-air'}"></span>${status}</td>
+                    </tr>`;
+                }).join('');
+            }
+        }
+        if (!isAdminPage) {
+            if (!audioEnabled) {
+                if (el.groupButtonsSection) el.groupButtonsSection.style.display = 'none';
+                if (el.tetrapolGroups) el.tetrapolGroups.innerHTML = '';
+            } else {
+                if (el.groupButtonsSection) el.groupButtonsSection.style.display = '';
+                scanTetrapolClearGroups();
+                syncButtonGrid(el.tetrapolGroups, sortEntriesByGroupNumber(getTetrapolButtonEntries()), 'tetrapol');
+            }
+        }
+    }
+
+    async function toggleMonitoring(key) {
+        const entry = catalog.get(key);
+        if (!entry) return;
+        if (isEncryptedEntry(entry)) return;
+        lastAirBtnSig = '';
+        lastTpSig = '';
+        lastReceptionSig = '';
+        // Stream cards only — never touch Pulse / remote mixer listen here
+        if (entry.source === 'airband') {
+            const rawId = String(entry.rawId);
+            if (disabledAirband.has(rawId)) {
+                disabledAirband.delete(rawId);
+                saveDisabled();
+                updateAirbandButtons();
+                updateReceptionDisplay();
+                if (audioEnabled && shouldMonitorEntry(entry) && entry.on_air) requestStartEntry(entry);
+            } else {
+                disabledAirband.add(rawId);
+                saveDisabled();
+                updateAirbandButtons();
+                updateReceptionDisplay();
+                stopStreamMonitoring(entry);
+            }
+        } else {
+            const rawId = String(entry.rawId);
+            if (disabledTetrapol.has(rawId)) {
+                disabledTetrapol.delete(rawId);
+                saveDisabled();
+                updateTetrapolListing();
+                updateReceptionDisplay();
+                if (audioEnabled && shouldMonitorEntry(entry) && entry.on_air) requestStartEntry(entry);
+            } else {
+                disabledTetrapol.add(rawId);
+                saveDisabled();
+                updateTetrapolListing();
+                updateReceptionDisplay();
+                stopStreamMonitoring(entry);
+            }
+        }
+    }
+
+    /* ---- Shared players / queue ---- */
+
+    function ensureStreamsSection() {
+        if (!el.streamsSection) return;
+        const count = players.size + exclusiveQueue.length + (exclusiveActive ? 1 : 0);
+        // Une fois l'audio activé, les commandes (volume / file) restent visibles.
+        // Seules les cards apparaissent / disparaissent dans le conteneur.
+        if (audioEnabled || count > 0) {
+            el.streamsSection.style.display = 'block';
+        }
+        if (el.streamsContainer && count === 0) {
+            if (!el.streamsContainer.querySelector('.no-data')) {
+                el.streamsContainer.innerHTML = '<div class="no-data">Aucun stream actif</div>';
+            }
+        } else if (el.streamsContainer && count > 0) {
+            const placeholder = el.streamsContainer.querySelector('.no-data');
+            if (placeholder) placeholder.remove();
+        }
+        setDot(el.streamsStatus, count > 0);
+    }
+
+    function getAudio(entry) {
+        if (!entry) return null;
+        return entry.player?.audioElement || entry.audio || null;
+    }
+
+    function updateCardLabels(card, audioEl, paused) {
+        const muteBtn = card.querySelector('.mute-btn');
+        const pauseBtn = card.querySelector('.pause-btn');
+        if (muteBtn && audioEl) muteBtn.textContent = audioEl.muted ? '🔊 Unmute' : '🔇 Mute';
+        if (pauseBtn) pauseBtn.textContent = paused ? '▶️ Lecture' : '⏸️ Pause';
+    }
+
+    function cancelBlankCountdown(key) {
+        if (blankTimers[key]) {
+            clearTimeout(blankTimers[key]);
+            delete blankTimers[key];
+        }
+        delete blankSince[key];
+        delete blankDeadlines[key];
+    }
+
+    function getBlankAgeMs(key, seg) {
+        if (seg?.ringBuffer && typeof seg.ringBuffer.effectiveBlankSecAt === 'function') {
+            const rb = seg.ringBuffer;
+            const bytePos = getPlaybackBytePos(seg);
+            const inBlank = typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos);
+            const nearLiveBlank = getRingWaitingSeconds(seg) <= 0.5 && liveEdgeIsBlank(seg);
+            if (inBlank || nearLiveBlank || rb.inBlank) {
+                const pos = inBlank ? bytePos : Math.max(bytePos, rb.totalBytesWritten - 1);
+                const fromRing = Math.round(rb.effectiveBlankSecAt(pos) * 1000);
+                if (fromRing > 0) return fromRing;
+                if (rb.inBlank && rb.blankStartedAtMs) {
+                    return Math.max(0, Math.round(performance.now() - rb.blankStartedAtMs));
+                }
+            }
+        }
+        if (seg?.playbackBlankSinceMs != null) {
+            return Math.max(0, performance.now() - seg.playbackBlankSinceMs);
+        }
+        if (blankSince[key] != null) return Math.max(0, Date.now() - blankSince[key]);
+        return 0;
+    }
+
+    function isExclusiveSegmentKey(key) {
+        return exclusiveActive?.key === key || exclusiveQueue.some((s) => s.key === key);
+    }
+
+    function isPlaybackInBlank(seg) {
+        const bp = seg?.bufferPlayer;
+        const rb = seg?.ringBuffer;
+        if (!bp?.hasStarted || !rb || typeof rb.isBlankAtByte !== 'function') return false;
+        const bytePos = typeof bp.playbackByteOffset === 'function'
+            ? bp.playbackByteOffset()
+            : rb.readByteOffset;
+        return rb.isBlankAtByte(bytePos);
+    }
+
+    function updatePlaybackBlankState(seg) {
+        if (!seg?.ringBuffer) {
+            seg.playbackBlankSinceMs = null;
+            return false;
+        }
+        const isActive = exclusiveActive === seg;
+        if (!isActive || !seg.bufferPlayer?.hasStarted) {
+            return !!seg.playbackBlankSinceMs;
+        }
+        const inBlank = isPlaybackInBlank(seg);
+        if (inBlank) {
+            if (seg.playbackBlankSinceMs == null) seg.playbackBlankSinceMs = performance.now();
+            return true;
+        }
+        // Ne pas annuler le compte à rebours sur un faux positif MSE :
+        // tant que le live est blanc / deadline active, on reste en "fin de com".
+        if (blankDeadlines[seg.key] && liveEdgeIsBlank(seg)) return true;
+        if (seg.playbackBlankSinceMs != null && liveEdgeIsBlank(seg)
+            && getRingWaitingSeconds(seg) <= 0.5) {
+            return true;
+        }
+        // Sortie réelle du blanc (nouvelle parole) — gérée par maybeSkip / title ahead.
+        if (getTitleAheadOfPlayback(seg) || !liveEdgeIsBlank(seg)) {
+            seg.playbackBlankSinceMs = null;
+            return false;
+        }
+        return seg.playbackBlankSinceMs != null;
+    }
+
+    function getPlaybackBytePos(seg) {
+        const bp = seg?.bufferPlayer;
+        const rb = seg?.ringBuffer;
+        if (!rb) return 0;
+        if (bp && typeof bp.playbackByteOffset === 'function') return bp.playbackByteOffset();
+        return rb.readByteOffset || 0;
+    }
+
+    /**
+     * Titre non vide strictement après la position de lecture (nouvelle com).
+     * Ne pas utiliser l'historique passé — sinon une vieille com bloque la fermeture.
+     */
+    function getTitleAheadOfPlayback(seg) {
+        const rb = seg?.ringBuffer;
+        if (!rb) return '';
+        const bytePos = getPlaybackBytePos(seg);
+        const next = typeof rb.nextTitleAfterByte === 'function'
+            ? rb.nextTitleAfterByte(bytePos)
+            : null;
+        if (next) return String(next.title || '').trim();
+        // Live a quitté le blanc alors que la lecture est encore dessus.
+        if (!rb.inBlank && String(rb.lastTitle || '').trim() && rb.isBlankAtByte?.(bytePos)) {
+            return String(rb.lastTitle).trim();
+        }
+        return '';
+    }
+
+    function liveEdgeIsBlank(seg) {
+        const rb = seg?.ringBuffer;
+        if (!rb) return true;
+        // Pendant la marge de 2 s, l'audio appartient encore à la com.
+        if (rb.blankGraceActive) return false;
+        if (rb.inBlank) return true;
+        return !String(rb.lastTitle || '').trim();
+    }
+
+    /**
+     * Si la lecture est dans un blanc mais qu'une nouvelle transmission est déjà
+     * dans le tampon (ou arrive en live), sauter le blanc et continuer / rattraper
+     * le direct — sans fermer la carte.
+     */
+    function maybeSkipBlankToNextTransmission(seg) {
+        if (!seg || exclusiveActive !== seg || seg.suspendedByUser) return false;
+        const rb = seg.ringBuffer;
+        const bp = seg.bufferPlayer;
+        if (!rb || !bp?.hasStarted) return false;
+
+        const bytePos = getPlaybackBytePos(seg);
+        const inBlank = typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos);
+        const ending = !!(blankDeadlines[seg.key]
+            || seg.pendingFinishAfterDrain
+            || seg.playbackBlankSinceMs != null);
+        if (!inBlank && !ending) return false;
+
+        const next = typeof rb.nextTitleAfterByte === 'function'
+            ? rb.nextTitleAfterByte(bytePos)
+            : null;
+        const liveResumed = !rb.inBlank && !!String(rb.lastTitle || '').trim() && inBlank;
+        if (!next && !liveResumed) return false;
+
+        cancelBlankCountdown(seg.key);
+        seg.playbackBlankSinceMs = null;
+        seg.pendingFinishAfterDrain = false;
+        if (seg.card) {
+            seg.card.classList.remove('ending');
+            seg.card.classList.add('playing');
+        }
+
+        if (seg._skipBlankBusy) return true;
+        seg._skipBlankBusy = true;
+
+        let action;
+        if (next) {
+            const bytesBehindLive = Math.max(0, rb.totalBytesWritten - next.byteOffset);
+            const secBehindLive = bytesBehindLive / Math.max(1, rb.bitrate / 8);
+            const nearLive = secBehindLive <= (getLiveWaitingThreshold() + 0.5);
+            action = nearLive && typeof bp.jumpToLive === 'function'
+                ? bp.jumpToLive()
+                : (typeof bp.seekToByte === 'function'
+                    ? bp.seekToByte(next.byteOffset)
+                    : Promise.resolve());
+        } else {
+            action = typeof bp.jumpToLive === 'function' ? bp.jumpToLive() : Promise.resolve();
+        }
+
+        Promise.resolve(action)
+            .then(() => {
+                syncRingBufferTitleDisplay(seg);
+                updateRingProgressBar(seg);
+            })
+            .catch((err) => logStreamError(seg.key, err))
+            .finally(() => { seg._skipBlankBusy = false; });
+        return true;
+    }
+
+    function getBufferedLatestTitle(seg) {
+        const rb = seg?.ringBuffer;
+        if (!rb?.titleChanges?.length) return (seg?.ringLastTitle || '').trim();
+        // Préférer le titre courant live s'il est non vide.
+        if (!rb.inBlank && String(rb.lastTitle || '').trim()) {
+            return String(rb.lastTitle).trim();
+        }
+        for (let i = rb.titleChanges.length - 1; i >= 0; i--) {
+            const t = String(rb.titleChanges[i].title || '').trim();
+            if (t) return t;
+        }
+        return '';
+    }
+
+    function getSegmentDisplayTitle(seg) {
+        if (!seg) return '';
+        if (exclusiveActive === seg && seg.bufferPlayer?.hasStarted) {
+            return getRingBufferDisplayTitle(seg);
+        }
+        return getBufferedLatestTitle(seg);
+    }
+
+    function updateEndingStatus(key) {
+        const deadline = blankDeadlines[key];
+        if (!deadline) return;
+        const seg = (exclusiveActive?.key === key ? exclusiveActive : null)
+            || exclusiveQueue.find(s => s.key === key)
+            || null;
+        const remainingMs = Math.max(0, deadline - Date.now());
+        const remainingSec = Math.ceil(remainingMs / 1000);
+        const text = remainingSec > 0 ? `En attente (${remainingSec}s)` : 'Fermeture…';
+        const apply = (card) => {
+            if (!card) return;
+            card.classList.add('ending');
+            card.classList.remove('playing');
+            const st = card.querySelector('.card-status');
+            if (st) st.textContent = text;
+        };
+        const p = players.get(key);
+        apply(p?.card);
+        if (exclusiveActive?.key === key) apply(exclusiveActive.card);
+        const queued = exclusiveQueue.find(s => s.key === key);
+        if (queued && queued !== exclusiveActive) apply(queued.card);
+    }
+
+    function ensureEndingStatusInterval() {
+        if (inactivityStatusInterval) return;
+        inactivityStatusInterval = setInterval(() => {
+            const keys = Object.keys(blankDeadlines);
+            keys.forEach(updateEndingStatus);
+            if (!Object.keys(blankDeadlines).length) {
+                clearInterval(inactivityStatusInterval);
+                inactivityStatusInterval = null;
+            }
+        }, 250);
+    }
+
+    function armBlankCountdown(key) {
+        if (blankTimers[key]) return;
+
+        const seg = (exclusiveActive?.key === key ? exclusiveActive : null)
+            || exclusiveQueue.find(s => s.key === key)
+            || null;
+        if (blankSince[key] == null) {
+            blankSince[key] = seg?.playbackBlankSinceMs != null
+                ? (Date.now() - (performance.now() - seg.playbackBlankSinceMs))
+                : Date.now();
+        }
+        const age = getBlankAgeMs(key, seg);
+        debugStreamTitleLog('blank-countdown', {
+            key,
+            groupLabel: seg ? labelOf(catalogEntryFor(seg)) : '',
+            ageMs: Math.round(age),
+            holdMs: STREAM_END_HOLD_MS,
+            liveBlank: seg ? liveEdgeIsBlank(seg) : null,
+            playbackInBlank: seg ? isPlaybackInBlank(seg) : null,
+            StreamTitleAtPlay: seg ? (getSegmentDisplayTitle(seg) || '(empty)') : null
+        });
+
+        // Blanc déjà ≥ 7 s (sauté à l'ingest + wall) → aucune reprise : fermer tout de suite.
+        if (age >= STREAM_END_HOLD_MS) {
+            const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
+                || exclusiveQueue.find((s) => s.key === key);
+            if (liveSeg && getTitleAheadOfPlayback(liveSeg) && maybeSkipBlankToNextTransmission(liveSeg)) {
+                return;
+            }
+            if (liveSeg && getTitleAheadOfPlayback(liveSeg)) {
+                cancelBlankCountdown(key);
+                return;
+            }
+            if (!liveSeg || liveEdgeIsBlank(liveSeg)) stopEntry(key);
+            return;
+        }
+
+        const remainingMs = Math.max(50, STREAM_END_HOLD_MS - age);
+        blankDeadlines[key] = Date.now() + remainingMs;
+
+        const p = players.get(key);
+        if (p) {
+            p.ending = true;
+            updateEndingStatus(key);
+        } else {
+            updateEndingStatus(key);
+        }
+
+        blankTimers[key] = setTimeout(() => {
+            delete blankTimers[key];
+            delete blankSince[key];
+            delete blankDeadlines[key];
+            const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
+                || exclusiveQueue.find((s) => s.key === key);
+            // Nouvelle com pendant l'attente → poursuivre (skip blanc, pas de fermeture).
+            if (liveSeg && getTitleAheadOfPlayback(liveSeg) && maybeSkipBlankToNextTransmission(liveSeg)) {
+                return;
+            }
+            if (liveSeg && getTitleAheadOfPlayback(liveSeg)) return;
+
+            if (liveSeg && usesQueueRingBuffer()) {
+                const waiting = getRingWaitingSeconds(liveSeg);
+                if (waiting > 0.3 && !liveEdgeIsBlank(liveSeg)) {
+                    liveSeg.pendingFinishAfterDrain = true;
+                    if (liveSeg.card) {
+                        liveSeg.card.classList.add('ending');
+                        const st = liveSeg.card.querySelector('.card-status');
+                        if (st) st.textContent = 'Fin du tampon…';
+                    }
+                    return;
+                }
+            }
+            stopEntry(key);
+        }, remainingMs);
+
+        ensureEndingStatusInterval();
+    }
+
+    function noteEntryActivityForBlank(entry) {
+        if (!entry || !entry.key) return;
+        const key = entry.key;
+        const onAir = !!entry.on_air;
+        const was = entryWasOnAir.get(key);
+        entryWasOnAir.set(key, onAir);
+        // Falling edge: transmission ended according to mixer/SDR state.
+        // Use as blank signal even if ICY StreamTitle clear is late/missing
+        // (same role as tetrapol empty metadata after end_speech).
+        if (was === true && !onAir) {
+            const seg = (exclusiveActive?.key === key ? exclusiveActive : null)
+                || exclusiveQueue.find(s => s.key === key)
+                || null;
+            if (seg?.ringBuffer && typeof seg.ringBuffer.addTitleChange === 'function') {
+                if (!seg.ringBuffer.awaitingFirstTitle) {
+                    // Enregistrer le blanc dans le tampon uniquement — pas de fin de com live.
+                    seg.ringBuffer.addTitleChange({ StreamTitle: '' });
+                    debugStreamTitleLog('blank-from-on_air', {
+                        key,
+                        source: entry?.source || '?',
+                        groupLabel: labelOf(entry),
+                        StreamTitle: '(empty)',
+                        path: 'on_air-falling-edge'
+                    });
+                }
+            } else {
+                const hadTitle = !!(lastStreamTitles[key] || '').trim()
+                    || !!(players.get(key));
+                if (hadTitle) handleStreamMetadata(key, '');
+            }
+        }
+    }
+
+    function handleStreamMetadata(key, meta) {
+        let t = '';
+        if (typeof meta === 'string') {
+            t = meta.trim();
+        } else if (meta && typeof meta === 'object') {
+            t = String(meta.StreamTitle || '').trim();
+        }
+        const previous = (lastStreamTitles[key] || '').trim();
+        const isExclusive = isExclusiveSegmentKey(key);
+        if (!isExclusive) lastStreamTitles[key] = t;
+
+        const p = players.get(key);
+        const seg = (exclusiveActive?.key === key ? exclusiveActive : null)
+            || exclusiveQueue.find(s => s.key === key);
+        const card = p?.card || seg?.card;
+        const entry = catalogEntryFor(p?.entry || seg) || p?.entry || seg?.entry || catalog.get(key);
+
+        debugStreamTitleLog(t ? 'title' : 'blank', {
+            key,
+            source: entry?.source || '?',
+            groupLabel: entry ? labelOf(entry) : '',
+            StreamTitle: t || '(empty)',
+            previous: previous || '(empty)',
+            path: 'live-player'
+        });
+
+        if (isExclusive) {
+            if (t && seg) {
+                seg.ringLastTitle = t;
+                cancelBlankCountdown(key);
+                seg.pendingFinishAfterDrain = false;
+                syncRingBufferTitleDisplay(seg);
+            }
+            return;
+        }
+
+        lastStreamTitles[key] = t;
+
+        if (t) {
+            cancelBlankCountdown(key);
+            if (p) {
+                p.ending = false;
+                if (p.card) {
+                    p.card.classList.add('icecast-active', 'playing');
+                    p.card.classList.remove('ending');
+                    updateCardHeader(p.card, p.entry, { txTitle: t });
+                    const st = p.card.querySelector('.card-status');
+                    if (st) st.textContent = 'En cours';
+                    updateCardLabels(p.card, getAudio(p), p.paused);
+                }
+            }
+            if (card && seg) {
+                card.classList.remove('ending');
+                if (exclusiveActive?.key === key) card.classList.add('playing');
+                updateCardHeader(card, entry, {
+                    txTitle: t,
+                    role: queueRoleLabel(seg, exclusiveActive === seg)
+                });
+                const st = card.querySelector('.card-status');
+                if (st && exclusiveActive?.key === key) st.textContent = 'En cours';
+            }
+        } else if (previous) {
+            if (card && entry) {
+                updateCardHeader(card, entry, {
+                    txTitle: '',
+                    role: queueRoleLabel(seg, exclusiveActive === seg)
+                });
+            }
+            armBlankCountdown(key);
+        }
+    }
+
+    function clearPendingCardStart(key) {
+        const t = pendingCardStarts.get(key);
+        if (t) clearTimeout(t);
+        pendingCardStarts.delete(key);
+    }
+
+    /**
+     * Démarre une carte seulement si on_air reste vrai ≥ MIN_ON_AIR_START_MS.
+     * Si la carte existe déjà, ne rien filtrer (les petites reprises comptent).
+     */
+    function requestStartEntry(entry) {
+        if (!shouldMonitorEntry(entry)) return;
+        const key = entry.key;
+        const ownerKey = streamUrlOwnerKey(entry.streamUrl);
+        if (ownerKey !== key) return;
+        const has = players.has(key)
+            || exclusiveQueue.some((s) => s.key === key)
+            || (exclusiveActive && exclusiveActive.key === key);
+        if (has) {
+            clearPendingCardStart(key);
+            return;
+        }
+        if (pendingCardStarts.has(key)) return;
+        const timer = setTimeout(() => {
+            pendingCardStarts.delete(key);
+            const e = catalog.get(key) || entry;
+            if (!e || !e.on_air) return;
+            if (!shouldMonitorEntry(e)) return;
+            const ownerKey = streamUrlOwnerKey(e.streamUrl);
+            if (ownerKey !== key) return;
+            const stillHas = players.has(key)
+                || exclusiveQueue.some((s) => s.key === key)
+                || (exclusiveActive && exclusiveActive.key === key);
+            if (stillHas) return;
+            startEntry(e);
+        }, MIN_ON_AIR_START_MS);
+        pendingCardStarts.set(key, timer);
+    }
+
+    function startEntry(entry) {
+        clearPendingCardStart(entry?.key);
+        if (!shouldMonitorEntry(entry)) return;
+        const ownerKey = streamUrlOwnerKey(entry.streamUrl);
+        if (ownerKey !== entry.key) return;
+        if (players.has(entry.key)) return;
+        // Already in exclusive queue
+        if (exclusiveQueue.some(s => s.key === entry.key) || (exclusiveActive && exclusiveActive.key === entry.key))
+            return;
+
+        if (exclusivePlaybackMode) {
+            createExclusiveSegment(entry);
+            ensureStreamsSection();
+            return;
+        }
+
+        let audioEl;
+        let player = createStreamPlayer(entry.streamUrl, entry.key);
+        if (player) {
+            audioEl = player.audioElement;
+            audioEl.volume = globalVolume / 100;
+            player.play();
+        } else {
+            audioEl = new Audio(entry.streamUrl);
+            audioEl.crossOrigin = 'anonymous';
+            audioEl.volume = globalVolume / 100;
+            audioEl.play().catch(() => {});
+        }
+
+        const card = createLiveCard(entry, audioEl);
+        players.set(entry.key, { player, audio: audioEl, card, entry, paused: false, ending: false, userPaused: false });
+        // Until first non-empty title, do not arm blank (stream may buffer)
+        lastStreamTitles[entry.key] = '';
+        ensureStreamsSection();
+    }
+
+    function stopEntry(key) {
+        clearPendingCardStart(key);
+        cancelBlankCountdown(key);
+        delete lastStreamTitles[key];
+        const p = players.get(key);
+        if (p) {
+            try {
+                if (p.player?.stop) p.player.stop();
+                else if (p.audio) { p.audio.pause(); p.audio.src = ''; }
+            } catch (_) {}
+            if (p.card?.parentNode) p.card.parentNode.removeChild(p.card);
+            players.delete(key);
+        }
+        exclusiveQueue = exclusiveQueue.filter(s => {
+            if (s.key !== key) return true;
+            cleanupExclusive(s);
+            return false;
+        });
+        if (exclusiveActive && exclusiveActive.key === key) {
+            cleanupExclusive(exclusiveActive);
+            exclusiveActive = null;
+            promoteNext();
+        }
+        offAirSince.delete(key);
+        ensureStreamsSection();
+    }
+
+    function createLiveCard(entry, audioEl) {
+        const placeholder = el.streamsContainer.querySelector('.no-data');
+        if (placeholder) placeholder.remove();
+
+        const card = document.createElement('div');
+        card.className = 'stream-card playing';
+        card.dataset.key = entry.key;
+        card.innerHTML = `
+            ${cardHeaderHtml(entry, '')}
+            <div class="stream-controls stream-card-zone stream-card-zone-controls">
+                <button type="button" class="mute-btn">🔇 Mute</button>
+                <button type="button" class="pause-btn">⏸️ Pause</button>
+                <button type="button" class="stop-btn">⏹️ Stop</button>
+            </div>
+            <div class="icecast-info stream-card-zone stream-card-zone-status">
+                <div><strong>📊 Status:</strong> <span class="card-status">En cours</span></div>
+            </div>`;
+
+        card.querySelector('.mute-btn').addEventListener('click', () => {
+            const p = players.get(entry.key);
+            const a = getAudio(p);
+            if (!a) return;
+            a.muted = !a.muted;
+            updateCardLabels(card, a, p.paused);
+        });
+        card.querySelector('.pause-btn').addEventListener('click', () => {
+            const p = players.get(entry.key);
+            const a = getAudio(p);
+            if (!a || !p) return;
+            if (p.paused) {
+                if (p.player?.play) p.player.play();
+                else a.play().catch(() => {});
+                p.paused = false;
+                p.userPaused = false;
+                p.ending = false;
+                card.classList.add('playing');
+                card.classList.remove('ending');
+                card.querySelector('.card-status').textContent = 'En cours';
+            } else {
+                a.pause();
+                p.paused = true;
+                p.userPaused = true;
+                card.classList.remove('playing');
+                card.querySelector('.card-status').textContent = 'En pause';
+            }
+            updateCardLabels(card, a, p.paused);
+        });
+        card.querySelector('.stop-btn').addEventListener('click', () => {
+            if (entry.source === 'airband') disabledAirband.add(String(entry.rawId));
+            else disabledTetrapol.add(String(entry.rawId));
+            saveDisabled();
+            lastAirBtnSig = '';
+            lastTpSig = '';
+            stopStreamMonitoring(entry);
+            updateAirbandButtons();
+            updateTetrapolListing();
+        });
+
+        el.streamsContainer.appendChild(card);
+        return card;
+    }
+
+    function getRingBufferKit() {
+        return window.QueueRingBufferKit || null;
+    }
+
+    /** Firefox (et Safari) : pas de SourceBuffer audio/mpeg → pas de file MSE. */
+    function mseMpegSupported() {
+        try {
+            return typeof MediaSource !== 'undefined'
+                && typeof MediaSource.isTypeSupported === 'function'
+                && MediaSource.isTypeSupported('audio/mpeg');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function usesQueueRingBuffer() {
+        return exclusivePlaybackMode && !!getRingBufferKit() && mseMpegSupported();
+    }
+
+    function ensureRingUiTimer() {
+        if (ringUiTimer || !exclusivePlaybackMode) return;
+        ringUiTimer = setInterval(() => {
+            const all = [...exclusiveQueue];
+            if (exclusiveActive) all.push(exclusiveActive);
+            if (!all.length) {
+                clearInterval(ringUiTimer);
+                ringUiTimer = null;
+                return;
+            }
+            all.forEach((seg) => {
+                if (typeof seg.ringBuffer?.pollBlankGrace === 'function') {
+                    seg.ringBuffer.pollBlankGrace();
+                }
+                updateRingProgressBar(seg);
+                updatePlaybackBlankState(seg);
+                if (blankDeadlines[seg.key]) updateEndingStatus(seg.key);
+                else syncRingBufferTitleDisplay(seg);
+                maybeForcePromoteNearFullBuffer(seg);
+                maybeFinishRingSegment(seg);
+            });
+            if (exclusiveActive) maybeResumeActiveRingPlayback(exclusiveActive);
+            if (exclusiveActive) checkPriorityPreempt();
+        }, RING_UI_INTERVAL_MS);
+    }
+
+    function getRingWaitingSeconds(seg) {
+        if (!seg?.ringBuffer) return 0;
+        const ahead = seg.bufferPlayer ? seg.bufferPlayer.bufferedAhead() : 0;
+        return seg.ringBuffer.unreadSeconds + ahead;
+    }
+
+    function segmentHasRingContent(seg) {
+        if (!seg?.ringBuffer) return false;
+        // Playable audio only — a leftover ICY title must not keep the card alive.
+        return (seg.ringBuffer.bytesInBuffer || 0) > 0
+            || getRingWaitingSeconds(seg) > 0.05;
+    }
+
+    function updateRingProgressBar(seg) {
+        if (!seg?.card || !seg.ringBuffer) return;
+        const cfg = getRingBufferKit()?.QUEUE_BUFFER_CONFIG;
+        const max = cfg?.bufferDurationSec || 120;
+        const waiting = getRingWaitingSeconds(seg);
+        const fillPct = Math.min(100, (waiting / max) * 100);
+        let bar = seg.card.querySelector('.ring-progress');
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.className = 'ring-progress';
+            bar.innerHTML = '<div class="ring-progress-fill"></div>';
+            const info = seg.card.querySelector('.icecast-info') || seg.card;
+            info.appendChild(bar);
+        }
+        const fill = bar.querySelector('.ring-progress-fill');
+        if (fill) fill.style.width = fillPct + '%';
+        const bufEl = seg.card.querySelector('.card-buffer');
+        if (bufEl) {
+            // Same basis as the gauge (waiting seconds), not fillRatio (stored window).
+            bufEl.textContent = waiting >= 0.3
+                ? `${waiting.toFixed(1)} s / ${max} s`
+                : 'direct';
+        }
+        updateLiveButton(seg);
+    }
+
+    function getRingBufferDisplayTitle(seg) {
+        const bp = seg?.bufferPlayer;
+        const rb = seg?.ringBuffer;
+        if (!bp || !rb) return (seg?.ringLastTitle || '').trim();
+        const bytePos = typeof bp.playbackByteOffset === 'function'
+            ? bp.playbackByteOffset()
+            : rb.readByteOffset;
+        if (typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos)) {
+            return '';
+        }
+        if (typeof rb.titleForByte === 'function') {
+            const titleAtPos = rb.titleForByte(bytePos);
+            if (titleAtPos !== null && titleAtPos !== undefined) {
+                return String(titleAtPos).trim();
+            }
+        }
+        return (seg.ringLastTitle || lastStreamTitles[seg.key] || '').trim();
+    }
+
+    function syncRingBufferTitleDisplay(seg) {
+        if (!seg?.card || !seg.ringBuffer) return;
+        const entry = catalogEntryFor(seg);
+        const display = getSegmentDisplayTitle(seg);
+        if (window.__MONITOR_DEBUG__) {
+            const prev = seg._debugLastPlayTitle;
+            const next = display || '(empty)';
+            if (prev !== next) {
+                seg._debugLastPlayTitle = next;
+                console.log(
+                    '%c[debug:play]%c StreamTitle at playback',
+                    'background:#6a1b9a;color:#fff;padding:1px 6px;border-radius:3px',
+                    'color:inherit',
+                    {
+                        t: new Date().toISOString().slice(11, 23),
+                        key: seg.key,
+                        groupLabel: labelOf(entry),
+                        StreamTitle: next,
+                        bytePos: Math.round(getPlaybackBytePos(seg)),
+                        unreadSec: Number((getRingWaitingSeconds(seg) || 0).toFixed(2)),
+                        playbackInBlank: isPlaybackInBlank(seg),
+                        active: exclusiveActive === seg
+                    }
+                );
+            }
+        }
+        updateCardHeader(seg.card, entry, {
+            txTitle: display,
+            role: queueRoleLabel(seg, exclusiveActive === seg)
+        });
+        const status = seg.card.querySelector('.card-status');
+        if (!status) return;
+        if (blankDeadlines[seg.key]) {
+            updateEndingStatus(seg.key);
+            return;
+        }
+        const isActive = exclusiveActive === seg;
+        if (isActive) {
+            const inBlank = isPlaybackInBlank(seg);
+            const waiting = getRingWaitingSeconds(seg);
+            if (seg.ringPlaybackPending) {
+                status.textContent = 'Tamponnage…';
+            } else if (inBlank && waiting <= 0.5) {
+                status.textContent = 'Fin de com…';
+            } else if (waiting > getLiveWaitingThreshold()) {
+                status.textContent = `Rattrapage (${waiting.toFixed(1)}s)`;
+            } else {
+                status.textContent = 'En cours';
+            }
+        } else if (seg.suspendedByUser) {
+            status.textContent = 'En pause';
+        } else if (segmentHasRingContent(seg)) {
+            status.textContent = `En attente (${getRingWaitingSeconds(seg).toFixed(1)}s)`;
+        } else {
+            status.textContent = 'En attente';
+        }
+    }
+
+    function initExclusiveRingBuffer(seg) {
+        const kit = getRingBufferKit();
+        if (!kit || seg.ringBuffer) return;
+        const cfg = kit.QUEUE_BUFFER_CONFIG;
+        seg.ringBuffer = new kit.AudioRingBuffer(cfg.bufferDurationSec, cfg.fallbackBitrate, cfg);
+        // Analogique : ne pas remplir le tampon tant qu'il n'y a pas de StreamTitle (blanc initial).
+        if (seg.entry?.source === 'airband' && typeof seg.ringBuffer.beginAwaitingStreamTitle === 'function') {
+            seg.ringBuffer.beginAwaitingStreamTitle();
+        }
+        seg.ringBlankSinceMs = null;
+        seg.playbackBlankSinceMs = null;
+        seg.ringLastTitle = '';
+        seg.ringLastStoredBytes = 0;
+        seg.ringLastGrowthMs = null;
+        seg.ringPlaybackPending = false;
+        seg.bufferForcePromoted = false;
+    }
+
+    function ensureSegmentQueueAudio(seg) {
+        if (seg.queueAudioEl) return seg.queueAudioEl;
+        const audio = document.createElement('audio');
+        audio.className = 'queue-ring-audio';
+        audio.style.display = 'none';
+        audio.setAttribute('playsinline', '');
+        audio.setAttribute('webkit-playsinline', '');
+        audio.preload = 'auto';
+        try { audio.setAttribute('autoplay', ''); } catch (_) {}
+        document.body.appendChild(audio);
+        seg.queueAudioEl = audio;
+        return audio;
+    }
+
+    function ensureSegmentBufferPlayer(seg) {
+        const kit = getRingBufferKit();
+        if (!seg.ringBuffer || seg.bufferPlayer) return seg.bufferPlayer;
+        const audio = ensureSegmentQueueAudio(seg);
+        seg.bufferPlayer = new kit.BufferPlayer(audio, seg.ringBuffer, kit.QUEUE_BUFFER_CONFIG);
+        audio.volume = globalVolume / 100;
+        return seg.bufferPlayer;
+    }
+
+    function buildBufferPlayerWrapper(seg) {
+        const bp = seg.bufferPlayer;
+        return {
+            audioElement: seg.queueAudioEl,
+            play: (opts) => bp?.play(opts),
+            pause: () => bp?.pause(),
+            stop: () => {
+                bp?.pause();
+                bp?.reset();
+            }
+        };
+    }
+
+    function startQueueRingIngestion(seg) {
+        const kit = getRingBufferKit();
+        if (!kit) return;
+        initExclusiveRingBuffer(seg);
+        if (seg.ringIngestor) return;
+
+        const isActive = exclusiveActive === seg && !seg.suspendedByUser;
+        if (!isActive) seg.ringBuffer.setPlaybackPaused(true);
+
+        console.info('queue', 'ingestion ring', seg.key);
+        seg.ringIngestor = new kit.StreamIngestor(
+            seg.ringBuffer,
+            seg.url,
+            kit.QUEUE_BUFFER_CONFIG,
+            {
+                onConnected: (meta) => {
+                    if (meta.icyBr) seg.ringBuffer.setBitrate(meta.icyBr);
+                    debugStreamTitleLog('ingest-connected', {
+                        key: seg.key,
+                        groupLabel: labelOf(catalogEntryFor(seg)),
+                        icyMetaInt: meta.icyMetaInt,
+                        icyBr: meta.icyBr,
+                        path: 'ring-ingest'
+                    });
+                },
+                onStream: () => onRingBufferStream(seg),
+                onMetadata: (value, changed) => onRingBufferMetadata(seg, value, changed),
+                onError: (err) => {
+                    if (err?.name === 'AbortError') return;
+                    logStreamError(seg.key, err);
+                }
+            }
+        );
+        seg.ringLastStoredBytes = seg.ringBuffer.totalBytesWritten || 0;
+        seg.ringLastGrowthMs = performance.now();
+        seg.ringIngestor.start();
+        ensureRingUiTimer();
+    }
+
+    function onRingBufferMetadata(seg, value, changed) {
+        const meta = value?.metadata || value || {};
+        const rawTitle = meta.StreamTitle ?? meta.streamTitle ?? meta.title ?? meta.Song ?? '';
+        const title = String(rawTitle ?? '').trim();
+        const rb = seg.ringBuffer;
+        const entry = catalogEntryFor(seg);
+        debugStreamTitleLog(title ? 'ingest-title' : 'ingest-blank', {
+            key: seg.key,
+            source: entry?.source || seg.entry?.source || '?',
+            groupLabel: labelOf(entry || seg.entry),
+            StreamTitle: title || '(empty)',
+            raw: rawTitle == null ? null : String(rawTitle),
+            metaKeys: meta && typeof meta === 'object' ? Object.keys(meta) : [],
+            changed: !!changed,
+            ringInBlank: !!rb?.inBlank,
+            awaitingFirstTitle: !!rb?.awaitingFirstTitle,
+            lastTitle: rb?.lastTitle == null ? null : String(rb.lastTitle),
+            bytesWritten: rb?.totalBytesWritten || 0,
+            unreadSec: Number(((rb?.unreadSeconds || 0).toFixed?.(2)) ?? (rb?.unreadSeconds || 0)),
+            playbackInBlank: !!isPlaybackInBlank(seg),
+            ending: !!(blankDeadlines[seg.key] || seg.playbackBlankSinceMs != null),
+            path: 'ring-ingest'
+        });
+        if (title) {
+            seg.ringLastTitle = title;
+            seg.analyzerConfirmedEnded = false;
+            seg.pendingFinishAfterDrain = false;
+            const wasEnding = !!(blankDeadlines[seg.key]
+                || seg.playbackBlankSinceMs != null
+                || isPlaybackInBlank(seg));
+            cancelBlankCountdown(seg.key);
+            seg.playbackBlankSinceMs = null;
+            // Reprise pendant blanc / fin de com : lecture continue sans le long silence.
+            if (exclusiveActive === seg && wasEnding) {
+                if (seg.card) {
+                    seg.card.classList.remove('ending');
+                    seg.card.classList.add('playing');
+                }
+                maybeSkipBlankToNextTransmission(seg);
+            }
+        }
+        // Les métadonnées live alimentent le ring buffer ; l'affichage suit la lecture.
+        syncRingBufferTitleDisplay(seg);
+        updateRingProgressBar(seg);
+        if (exclusiveQueue.includes(seg)) maybeForcePromoteNearFullBuffer(seg);
+    }
+
+    function onRingBufferStream(seg) {
+        const rb = seg.ringBuffer;
+        if (rb) {
+            const stored = rb.totalBytesWritten;
+            if (stored > (seg.ringLastStoredBytes || 0)) {
+                seg.ringLastStoredBytes = stored;
+                seg.ringLastGrowthMs = performance.now();
+            }
+        }
+        updateRingProgressBar(seg);
+        if (exclusiveQueue.includes(seg)) maybeForcePromoteNearFullBuffer(seg);
+        if (exclusiveActive === seg && !seg.suspendedByUser) {
+            maybeResumeActiveRingPlayback(seg);
+            checkPriorityPreempt();
+        }
+    }
+
+    function maybeForcePromoteNearFullBuffer(seg) {
+        if (!forceBeforeFull || !seg?.ringBuffer) return;
+        if (!exclusiveQueue.includes(seg) || seg.suspendedByUser) return;
+        if (seg.ringBuffer.fillRatio < RING_FORCE_PROMOTE_RATIO) return;
+
+        if (!exclusiveActive) {
+            exclusiveQueue = exclusiveQueue.filter(s => s.key !== seg.key);
+            seg.bufferForcePromoted = true;
+            exclusiveActive = seg;
+            startExclusivePlay(seg);
+            refreshExclusiveCards();
+            return;
+        }
+        if (exclusiveActive === seg) return;
+        const active = exclusiveActive;
+        if (!active.bufferPlayer?.hasStarted) return;
+        const unreadRatio = active.ringBuffer?.maxBytes
+            ? Math.min(1, active.ringBuffer.unreadBytes / active.ringBuffer.maxBytes)
+            : 1;
+        if (unreadRatio >= RING_YIELD_MAX_RATIO) return;
+        const inBlank = isPlaybackInBlank(active);
+        if (!inBlank && active.playbackBlankSinceMs == null) return;
+
+        active.suspendedByUser = false;
+        exclusiveQueue.unshift(active);
+        stopExclusivePlay(active, { keepBuffer: true });
+        exclusiveQueue = exclusiveQueue.filter(s => s.key !== seg.key);
+        exclusiveActive = seg;
+        seg.bufferForcePromoted = true;
+        startExclusivePlay(seg);
+        refreshExclusiveCards();
+    }
+
+    function maybeResumeActiveRingPlayback(seg) {
+        if (!seg || exclusiveActive !== seg || seg.suspendedByUser || seg.ringPlaybackPending) return;
+        const bp = seg.bufferPlayer;
+        if (!bp) return;
+        if (!bp.hasStarted) {
+            if ((seg.ringBuffer?.bytesInBuffer || 0) >= 256) {
+                activateSegmentRingPlayback(seg, { playFromStart: true });
+            }
+            return;
+        }
+        if (!bp.isPlaying && (bp.canPlay() || (seg.ringBuffer?.unreadBytes || 0) >= 256)) {
+            bp.play().catch(() => {});
+        }
+    }
+
+    async function activateSegmentRingPlayback(seg, options = {}) {
+        if (!seg.ringBuffer) startQueueRingIngestion(seg);
+        ensureSegmentBufferPlayer(seg);
+        const bp = seg.bufferPlayer;
+        if (!bp) return false;
+
+        seg.ringPlaybackPending = true;
+        seg.playbackPlayer = buildBufferPlayerWrapper(seg);
+        if (seg.queueAudioEl) seg.queueAudioEl.volume = globalVolume / 100;
+
+        const playGen = (seg._ringPlayGen = (seg._ringPlayGen || 0) + 1);
+        const stillActive = () => seg._ringPlayGen === playGen
+            && exclusiveActive === seg
+            && !seg.suspendedByUser;
+
+        if (options.playFromStart && seg.ringBuffer) {
+            seg.ringBuffer.readByteOffset = seg.ringBuffer.oldestByteOffset;
+        }
+
+        const deadline = Date.now() + 30000;
+        while ((seg.ringBuffer?.bytesInBuffer || 0) < 256 && Date.now() < deadline) {
+            if (!stillActive()) {
+                seg.ringPlaybackPending = false;
+                return false;
+            }
+            await new Promise((r) => setTimeout(r, 100));
+        }
+
+        if (!stillActive()) {
+            seg.ringPlaybackPending = false;
+            return false;
+        }
+        if ((seg.ringBuffer?.bytesInBuffer || 0) < 256) {
+            seg.ringPlaybackPending = false;
+            return false;
+        }
+
+        try {
+            await bp.play({ fromStart: options.playFromStart === true });
+            seg.ringPlaybackPending = false;
+            updateRingProgressBar(seg);
+            refreshExclusiveCards();
+            return true;
+        } catch (err) {
+            seg.ringPlaybackPending = false;
+            logStreamError(seg.key, err);
+            return false;
+        }
+    }
+
+    function stopQueueRingPipeline(seg, options = {}) {
+        if (!seg) return;
+        if (seg.ringIngestor) {
+            try { seg.ringIngestor.stop(); } catch (_) {}
+            seg.ringIngestor = null;
+        }
+        if (!options.keepBuffer) {
+            if (seg.bufferPlayer) {
+                try { seg.bufferPlayer.reset(); } catch (_) {}
+                seg.bufferPlayer = null;
+            }
+            if (seg.ringBuffer) {
+                try { seg.ringBuffer.reset(); } catch (_) {}
+                seg.ringBuffer = null;
+            }
+        } else if (seg.bufferPlayer) {
+            try { seg.bufferPlayer.pause(); } catch (_) {}
+            if (seg.ringBuffer) seg.ringBuffer.setPlaybackPaused(true);
+        }
+        if (!options.keepAudio && seg.queueAudioEl) {
+            try {
+                seg.queueAudioEl.pause();
+                seg.queueAudioEl.removeAttribute('src');
+                seg.queueAudioEl.load();
+            } catch (_) {}
+            if (!options.keepBuffer) {
+                seg.queueAudioEl.remove();
+                seg.queueAudioEl = null;
+            }
+        }
+        seg.playbackPlayer = null;
+        seg.ringPlaybackPending = false;
+    }
+
+    function maybeFinishRingSegment(seg) {
+        if (!seg || !usesQueueRingBuffer()) return;
+        const isActive = exclusiveActive === seg;
+        const inQueue = exclusiveQueue.includes(seg);
+        if (!isActive && !inQueue) return;
+
+        if (!seg.bufferPlayer?.hasStarted) return;
+        const ageMs = performance.now() - (seg.createdAtMs || 0);
+        if (ageMs < 2000) return;
+
+        // Vraie reprise uniquement (titre APRÈS la tête de lecture / live non blanc).
+        if (isActive && getTitleAheadOfPlayback(seg) && maybeSkipBlankToNextTransmission(seg)) {
+            return;
+        }
+
+        const waiting = getRingWaitingSeconds(seg);
+        const inPlaybackBlank = isActive ? updatePlaybackBlankState(seg) : false;
+        const titleAhead = getTitleAheadOfPlayback(seg);
+        const liveBlank = liveEdgeIsBlank(seg);
+
+        if (seg.pendingFinishAfterDrain) {
+            if (titleAhead && maybeSkipBlankToNextTransmission(seg)) return;
+            if (waiting <= 0.3 && !titleAhead && liveBlank) {
+                stopEntry(seg.key);
+            }
+            return;
+        }
+
+        // Encore du rattrapage de parole (pas un blanc) : ne pas fermer.
+        if (waiting > 0.5 && !inPlaybackBlank) {
+            seg._nearLiveBlankSinceMs = null;
+            return;
+        }
+
+        if (!isActive) return;
+
+        if (titleAhead) {
+            maybeSkipBlankToNextTransmission(seg);
+            return;
+        }
+
+        // Blanc à la lecture, ou rattrapé le direct alors que le live est blanc.
+        const nearLiveBlank = waiting <= 0.5 && liveBlank;
+        if (!inPlaybackBlank && !nearLiveBlank) {
+            seg._nearLiveBlankSinceMs = null;
+            return;
+        }
+
+        if (inPlaybackBlank) {
+            seg._nearLiveBlankSinceMs = null;
+        } else if (seg._nearLiveBlankSinceMs == null) {
+            seg._nearLiveBlankSinceMs = performance.now();
+        }
+
+        // Âge réel du blanc (marge ring + silence sauté + wall clock).
+        const effectiveBlankMs = getBlankAgeMs(seg.key, seg);
+
+        // Rattrapage : blanc déjà > 7 s dans le tampon → aucune reprise, fermer.
+        if (effectiveBlankMs >= STREAM_END_HOLD_MS) {
+            stopEntry(seg.key);
+        } else if (effectiveBlankMs >= 200 && !blankTimers[seg.key]) {
+            armBlankCountdown(seg.key);
+        }
+    }
+
+    function createExclusiveSegment(entry) {
+        if (exclusiveQueue.some(s => s.key === entry.key) || (exclusiveActive && exclusiveActive.key === entry.key))
+            return;
+        const seg = {
+            key: entry.key,
+            entry,
+            url: entry.streamUrl,
+            suspendedByUser: false,
+            card: null,
+            playbackPlayer: null,
+            ringBuffer: null,
+            ringIngestor: null,
+            bufferPlayer: null,
+            queueAudioEl: null,
+            ringLastTitle: '',
+            ringBlankSinceMs: null,
+            playbackBlankSinceMs: null,
+            createdAtMs: performance.now(),
+            analyzerConfirmedEnded: false
+        };
+        seg.card = createExclusiveCard(seg);
+        exclusiveQueue.push(seg);
+        lastStreamTitles[entry.key] = '';
+        if (usesQueueRingBuffer()) {
+            startQueueRingIngestion(seg);
+        } else if (exclusivePlaybackMode && mseMpegSupported() && !getRingBufferKit()) {
+            // Module still loading — retry once ready (Chrome/Chromium only).
+            window.addEventListener('queue-ring-buffer-ready', () => {
+                if (usesQueueRingBuffer()
+                    && (exclusiveQueue.includes(seg) || exclusiveActive === seg)) {
+                    startQueueRingIngestion(seg);
+                }
+            }, { once: true });
+        }
+        // Prio : activer dès le début de com (sauf autre prio actif / tampon force ≥ 80 %).
+        if (!exclusiveActive) {
+            promoteNext();
+        } else if (isStreamPrioritySeg(seg)) {
+            if (!preemptActiveWithPriority(seg)) refreshExclusiveCards();
+        } else {
+            refreshExclusiveCards();
+        }
+        ensureRingUiTimer();
+    }
+
+    function createExclusiveCard(seg) {
+        const placeholder = el.streamsContainer.querySelector('.no-data');
+        if (placeholder) placeholder.remove();
+        const card = document.createElement('div');
+        card.className = 'stream-card queued';
+        card.dataset.key = seg.key;
+        // File : uniquement « Écouter » (comme tetrapol-kit). Actif : Mute/Pause/Direct/Stop.
+        card.innerHTML = `
+            ${cardHeaderHtml(catalogEntryFor(seg), '')}
+            <div class="stream-controls stream-card-zone stream-card-zone-controls queue-card-controls">
+                <button type="button" class="queue-promote-btn" title="Écouter maintenant">▶️ Écouter</button>
+                <button type="button" class="mute-btn" style="display:none">🔇 Mute</button>
+                <button type="button" class="pause-btn" style="display:none">⏸️ Pause</button>
+                <button type="button" class="live-btn" data-live-enabled="0" disabled style="display:none">⏭️ Direct</button>
+                <button type="button" class="stop-btn" style="display:none">⏹️ Stop</button>
+            </div>
+            <div class="icecast-info stream-card-zone stream-card-zone-status">
+                <div><strong>📊 Status:</strong> <span class="card-status">En attente</span></div>
+                <div><strong>💾 Tampon:</strong> <span class="card-buffer">—</span></div>
+                <div class="ring-progress"><div class="ring-progress-fill"></div></div>
+            </div>`;
+        updateCardHeader(card, catalogEntryFor(seg), { role: 'file' });
+        card.querySelector('.queue-promote-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            promote(seg.key);
+        });
+        card.querySelector('.pause-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (exclusiveActive && exclusiveActive.key === seg.key) suspend(seg.key);
+        });
+        card.querySelector('.live-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            skipToLive(seg);
+        });
+        card.querySelector('.mute-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const audio = seg.queueAudioEl || seg.playbackPlayer?.audioElement;
+            if (!audio) return;
+            audio.muted = !audio.muted;
+            card.querySelector('.mute-btn').textContent = audio.muted ? '🔊 Unmute' : '🔇 Mute';
+        });
+        card.querySelector('.stop-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (seg.entry.source === 'airband') disabledAirband.add(String(seg.entry.rawId));
+            else disabledTetrapol.add(String(seg.entry.rawId));
+            saveDisabled();
+            lastAirBtnSig = '';
+            lastTpSig = '';
+            stopStreamMonitoring(seg.entry);
+            updateAirbandButtons();
+            updateTetrapolListing();
+        });
+        el.streamsContainer.appendChild(card);
+        return card;
+    }
+
+    function getLiveWaitingThreshold() {
+        const cfg = getRingBufferKit()?.QUEUE_BUFFER_CONFIG;
+        return cfg?.liveWaitingThresholdSec ?? 2.5;
+    }
+
+    function updateLiveButton(seg) {
+        if (!seg?.card) return;
+        const liveBtn = seg.card.querySelector('.live-btn');
+        if (!liveBtn) return;
+        const isActive = exclusiveActive === seg && !seg.suspendedByUser;
+        let enabled = liveBtn.dataset.liveEnabled === '1';
+        if (isActive && usesQueueRingBuffer() && seg.bufferPlayer?.hasStarted) {
+            const waiting = typeof seg.bufferPlayer.waitingSeconds === 'function'
+                ? seg.bufferPlayer.waitingSeconds()
+                : getRingWaitingSeconds(seg);
+            const liveOn = getLiveWaitingThreshold() + 0.35;
+            const liveOff = Math.max(0.2, getLiveWaitingThreshold() - 0.35);
+            if (!enabled && waiting > liveOn) enabled = true;
+            else if (enabled && waiting <= liveOff) enabled = false;
+        } else {
+            enabled = false;
+        }
+        liveBtn.dataset.liveEnabled = enabled ? '1' : '0';
+        liveBtn.disabled = !enabled;
+        liveBtn.style.display = isActive ? '' : 'none';
+    }
+
+    function skipToLive(seg) {
+        if (!seg || exclusiveActive !== seg) return;
+        if (!seg.bufferPlayer || typeof seg.bufferPlayer.jumpToLive !== 'function') return;
+        const liveBtn = seg.card?.querySelector('.live-btn');
+        if (liveBtn) liveBtn.dataset.liveEnabled = '0';
+        // Jump discards catch-up backlog and resumes near the live edge.
+        cancelBlankCountdown(seg.key);
+        seg.pendingFinishAfterDrain = false;
+        seg.bufferPlayer.jumpToLive()
+            .then(() => {
+                updateRingProgressBar(seg);
+                updateLiveButton(seg);
+                if (seg.playbackBlankSinceMs != null && getRingWaitingSeconds(seg) <= 0.5) {
+                    armBlankCountdown(seg.key);
+                }
+            })
+            .catch((err) => logStreamError(seg.key, err));
+    }
+
+    function cleanupExclusive(seg) {
+        cancelBlankCountdown(seg.key);
+        stopExclusivePlay(seg, { keepBuffer: false });
+        stopQueueRingPipeline(seg);
+        if (seg.card?.parentNode) seg.card.parentNode.removeChild(seg.card);
+    }
+
+    function promote(key) {
+        const seg = exclusiveQueue.find(s => s.key === key) || (exclusiveActive?.key === key ? exclusiveActive : null);
+        if (!seg) return;
+        if (exclusiveActive && exclusiveActive.key !== key) {
+            exclusiveQueue.unshift(exclusiveActive);
+            stopExclusivePlay(exclusiveActive, { keepBuffer: true });
+        }
+        exclusiveQueue = exclusiveQueue.filter(s => s.key !== key);
+        exclusiveActive = seg;
+        seg.suspendedByUser = false;
+        startExclusivePlay(seg);
+        refreshExclusiveCards();
+    }
+
+    function suspend(key) {
+        if (!exclusiveActive || exclusiveActive.key !== key) return;
+        exclusiveActive.suspendedByUser = true;
+        stopExclusivePlay(exclusiveActive, { keepBuffer: true });
+        exclusiveQueue.push(exclusiveActive);
+        exclusiveActive = null;
+        promoteNext();
+        refreshExclusiveCards();
+    }
+
+    function isStreamPrioritySeg(seg) {
+        if (!seg) return false;
+        return !!(seg.entry?.priority || isStreamPriority(seg.key));
+    }
+
+    function getActiveRingUnreadRatio() {
+        const active = exclusiveActive;
+        const rb = active?.ringBuffer;
+        if (!rb || !rb.maxBytes) return 0;
+        return Math.min(1, rb.unreadBytes / rb.maxBytes);
+    }
+
+    /**
+     * Un stream prio peut prendre la main sauf si :
+     * - l'actif est déjà un groupe prio, ou
+     * - « Bascule avant fin tampon » est coché et l'actif a été promu près
+     *   saturation et son tampon non lu est encore ≥ 80 %.
+     */
+    function canPreemptActiveForPriority() {
+        const active = exclusiveActive;
+        if (!active) return true;
+        if (isStreamPrioritySeg(active)) return false;
+        if (forceBeforeFull
+            && active.bufferForcePromoted
+            && getActiveRingUnreadRatio() >= RING_YIELD_MAX_RATIO) {
+            return false;
+        }
+        return true;
+    }
+
+    /** Passe un segment prio en actif (préemption) si les règles le permettent. */
+    function preemptActiveWithPriority(seg) {
+        if (!exclusivePlaybackMode || !seg || seg.suspendedByUser) return false;
+        if (!isStreamPrioritySeg(seg)) return false;
+        if (exclusiveActive === seg) return false;
+        if (!canPreemptActiveForPriority()) return false;
+
+        if (exclusiveActive) {
+            const displaced = exclusiveActive;
+            exclusiveQueue = exclusiveQueue.filter((s) => s.key !== displaced.key);
+            exclusiveQueue.unshift(displaced);
+            stopExclusivePlay(displaced, { keepBuffer: true });
+        }
+        exclusiveQueue = exclusiveQueue.filter((s) => s.key !== seg.key);
+        exclusiveActive = seg;
+        seg.suspendedByUser = false;
+        startExclusivePlay(seg);
+        refreshExclusiveCards();
+        return true;
+    }
+
+    /** Réévalue une prio en file quand le tampon de l'actif redescend sous 80 %. */
+    function checkPriorityPreempt() {
+        if (!exclusivePlaybackMode || !exclusiveActive) return;
+        if (isStreamPrioritySeg(exclusiveActive)) return;
+        const waiting = exclusiveQueue.find(
+            (s) => isStreamPrioritySeg(s) && !s.suspendedByUser
+        );
+        if (!waiting) return;
+        preemptActiveWithPriority(waiting);
+    }
+
+    function promoteNext() {
+        const prioIdx = exclusiveQueue.findIndex(s =>
+            isStreamPrioritySeg(s) && !s.suspendedByUser);
+        if (prioIdx >= 0) {
+            const [seg] = exclusiveQueue.splice(prioIdx, 1);
+            exclusiveActive = seg;
+            startExclusivePlay(seg);
+            refreshExclusiveCards();
+            return;
+        }
+        while (exclusiveQueue.length) {
+            const next = exclusiveQueue.shift();
+            if (next.suspendedByUser) {
+                exclusiveQueue.push(next);
+                if (exclusiveQueue.every(s => s.suspendedByUser)) break;
+                continue;
+            }
+            exclusiveActive = next;
+            startExclusivePlay(next);
+            refreshExclusiveCards();
+            return;
+        }
+        exclusiveActive = null;
+        refreshExclusiveCards();
+    }
+
+    function startExclusivePlayHtml(seg) {
+        stopQueueRingPipeline(seg);
+        if (seg._htmlPlayer) {
+            try { seg._htmlPlayer.stop(); } catch (_) {}
+            seg._htmlPlayer = null;
+        }
+        // <audio> sans Icy-MetaData → Icecast envoie du MP3 nu (OK Firefox).
+        const audioEl = new Audio(seg.url);
+        audioEl.crossOrigin = 'anonymous';
+        audioEl.volume = globalVolume / 100;
+        audioEl.play().catch(() => {});
+        const player = {
+            audioElement: audioEl,
+            play: () => audioEl.play().catch(() => {}),
+            pause: () => audioEl.pause(),
+            stop: () => {
+                try {
+                    audioEl.pause();
+                    audioEl.removeAttribute('src');
+                    audioEl.load();
+                } catch (_) {}
+            }
+        };
+        seg._htmlPlayer = player;
+        seg.queueAudioEl = audioEl;
+        seg.playbackPlayer = player;
+        seg.ringPlaybackPending = false;
+        if (seg.card) {
+            seg.card.classList.add('playing');
+            seg.card.classList.remove('queued');
+            const st = seg.card.querySelector('.card-status');
+            if (st) st.textContent = 'En cours';
+        }
+    }
+
+    function startExclusivePlay(seg) {
+        stopExclusivePlay(seg, { keepBuffer: true, keepIngest: true });
+        if (!mseMpegSupported()) {
+            startExclusivePlayHtml(seg);
+            return;
+        }
+        // Mode exclusif = pipeline ring buffer MSE (Chrome/Chromium).
+        if (!getRingBufferKit()) {
+            if (seg.card) {
+                const st = seg.card.querySelector('.card-status');
+                if (st) st.textContent = 'Tamponnage…';
+            }
+            window.addEventListener('queue-ring-buffer-ready', () => {
+                if (exclusiveActive === seg) startExclusivePlay(seg);
+            }, { once: true });
+            return;
+        }
+        if (!seg.ringIngestor) startQueueRingIngestion(seg);
+        if (seg.ringBuffer) seg.ringBuffer.setPlaybackPaused(false);
+        const fromStart = !(seg.bufferPlayer && seg.bufferPlayer.hasStarted);
+        activateSegmentRingPlayback(seg, { playFromStart: fromStart });
+        if (seg.card) {
+            seg.card.classList.add('playing');
+            seg.card.classList.remove('queued');
+        }
+    }
+
+    function stopExclusivePlay(seg, options = {}) {
+        if (!seg) return;
+        seg._ringPlayGen = (seg._ringPlayGen || 0) + 1;
+        if (seg._htmlPlayer) {
+            try { seg._htmlPlayer.stop(); } catch (_) {}
+            seg._htmlPlayer = null;
+        }
+        if (seg.bufferPlayer) {
+            try { seg.bufferPlayer.pause(); } catch (_) {}
+        }
+        if (seg.ringBuffer) seg.ringBuffer.setPlaybackPaused(true);
+        if (!options.keepBuffer && !options.keepIngest) {
+            stopQueueRingPipeline(seg, options);
+        } else if (!options.keepIngest && seg.ringIngestor && !options.keepBuffer) {
+            stopQueueRingPipeline(seg, options);
+        }
+        seg.playbackPlayer = null;
+        if (seg.card) {
+            seg.card.classList.remove('playing');
+            seg.card.classList.add('queued');
+        }
+    }
+
+    function refreshExclusiveCards() {
+        const all = [...exclusiveQueue];
+        if (exclusiveActive) all.unshift(exclusiveActive);
+        // Playing card first, then waiting cards (queue order).
+        if (el.streamsContainer) {
+            all.forEach((seg) => {
+                if (seg.card && seg.card.parentNode === el.streamsContainer) {
+                    el.streamsContainer.appendChild(seg.card);
+                }
+            });
+        }
+        all.forEach(seg => {
+            if (!seg.card) return;
+            const isActive = exclusiveActive && exclusiveActive.key === seg.key;
+            const status = seg.card.querySelector('.card-status');
+            const pauseBtn = seg.card.querySelector('.pause-btn');
+            const promoteBtn = seg.card.querySelector('.queue-promote-btn');
+            const entry = catalogEntryFor(seg);
+            const title = getSegmentDisplayTitle(seg);
+            updateCardHeader(seg.card, entry, {
+                txTitle: title,
+                role: queueRoleLabel(seg, isActive)
+            });
+            if (status && !blankDeadlines[seg.key]) {
+                if (isActive) {
+                    const waiting = getRingWaitingSeconds(seg);
+                    if (seg.ringPlaybackPending) {
+                        status.textContent = 'Tamponnage…';
+                    } else if (isPlaybackInBlank(seg) && waiting <= 0.5) {
+                        status.textContent = 'Fin de com…';
+                    } else if (waiting > getLiveWaitingThreshold()) {
+                        status.textContent = `Rattrapage (${waiting.toFixed(1)}s)`;
+                    } else {
+                        status.textContent = 'En cours';
+                    }
+                } else {
+                    status.textContent = seg.suspendedByUser
+                        ? 'En pause'
+                        : (segmentHasRingContent(seg)
+                            ? `En attente (${getRingWaitingSeconds(seg).toFixed(1)}s)`
+                            : 'En attente');
+                }
+            }
+            // File = uniquement Écouter ; actif = Mute / Pause / Direct / Stop
+            if (promoteBtn) {
+                promoteBtn.style.display = isActive ? 'none' : '';
+                promoteBtn.textContent = seg.suspendedByUser ? '▶️ Reprendre' : '▶️ Écouter';
+            }
+            ['mute-btn', 'pause-btn', 'live-btn', 'stop-btn'].forEach((cls) => {
+                const btn = seg.card.querySelector('.' + cls);
+                if (btn) btn.style.display = isActive ? '' : 'none';
+            });
+            if (pauseBtn && isActive) pauseBtn.textContent = '⏸️ Pause';
+            seg.card.classList.toggle('playing', !!isActive);
+            seg.card.classList.toggle('queued', !isActive);
+            if (isActive) syncRingBufferTitleDisplay(seg);
+            updateRingProgressBar(seg);
+            updateLiveButton(seg);
+        });
+        ensureRingUiTimer();
+    }
+
+    function syncPlayersFromCatalogNow() {
+        if (isAdminPage || !audioEnabled) return;
+        const now = Date.now();
+        catalog.forEach(entry => {
+            noteEntryActivityForBlank(entry);
+            const inExclusiveQ = exclusiveQueue.some(s => s.key === entry.key);
+            const isActiveEx = exclusiveActive && exclusiveActive.key === entry.key;
+            const has = players.has(entry.key) || inExclusiveQ || isActiveEx;
+            const monitored = shouldMonitorEntry(entry);
+
+            // Start when activity detected — wait MIN_ON_AIR_START_MS to ignore parasites.
+            // If a card is already open, short transmissions still fill the buffer as usual.
+            if (entry.on_air && monitored && !has) {
+                const ownerKey = streamUrlOwnerKey(entry.streamUrl);
+                // Exiger le propriétaire exact — ne pas démarrer si ownerKey est null
+                // (ex. fréquence courante désactivée sur un mount partagé).
+                if (ownerKey === entry.key) {
+                    offAirSince.delete(entry.key);
+                    requestStartEntry(entry);
+                }
+                return;
+            }
+            if (!entry.on_air) {
+                clearPendingCardStart(entry.key);
+            }
+
+            if (has && !isEnabled(entry)) {
+                stopEntry(entry.key);
+                return;
+            }
+
+            // Remplacement live par une autre fréquence / entrée sur le même mount.
+            if (has && entry.on_air) {
+                const ownerKey = streamUrlOwnerKey(entry.streamUrl);
+                if (ownerKey && ownerKey !== entry.key) {
+                    stopEntry(entry.key);
+                    return;
+                }
+            }
+
+            // Fin de com live : garder la carte tant que le ring a de l'audio à lire.
+            if (exclusivePlaybackMode && has && !entry.on_air) {
+                const seg = getExclusiveSegment(entry.key);
+                if (seg && usesQueueRingBuffer() && segmentHasRingContent(seg)) {
+                    offAirSince.delete(entry.key);
+                    return;
+                }
+            }
+
+            // Queued exclusive: keep while ring still holds audio / title.
+            // Only drop empty segments after off-air grace (legacy / no content).
+            if (exclusivePlaybackMode && inExclusiveQ && !isActiveEx && !entry.on_air) {
+                const seg = exclusiveQueue.find(s => s.key === entry.key);
+                if (seg && usesQueueRingBuffer() && segmentHasRingContent(seg)) {
+                    offAirSince.delete(entry.key);
+                    return;
+                }
+                if (!offAirSince.has(entry.key)) offAirSince.set(entry.key, now);
+                if (now - offAirSince.get(entry.key) >= OFF_AIR_GRACE_MS) {
+                    if (!seg || !segmentHasRingContent(seg)) stopEntry(entry.key);
+                }
+            } else if (entry.on_air) {
+                offAirSince.delete(entry.key);
+            }
+        });
+        pruneStreamCardsByUrlOwner();
+        [...players.keys()].forEach(key => {
+            if (!catalog.has(key)) stopEntry(key);
+        });
+    }
+
+    function syncPlayersFromCatalog() {
+        if (syncPlayersTimer) clearTimeout(syncPlayersTimer);
+        syncPlayersTimer = setTimeout(() => {
+            syncPlayersTimer = null;
+            syncPlayersFromCatalogNow();
+        }, SYNC_DEBOUNCE_MS);
+    }
+
+    /* ---- Pulse admin (Airband local + Tetrapol remote) ---- */
+
+    function updatePulseAdmin(state) {
+        if (state) pulseExclusiveState = state;
+        // Appliquer priority_groups AVANT le calcul de signature / early-return,
+        // sinon les autres instances ne voient jamais le changement de prio.
+        applyAirbandPulsePriorities(pulseExclusiveState);
+        applyTetrapolPulsePriorities(tpPulseExclusiveState);
+        if (!isAdminMode) return;
+
+        const abState = pulseExclusiveState || {};
+        const tpState = tpPulseExclusiveState || {};
+        const exclusive = !!(abState.exclusive || tpState.exclusive);
+        const forceOn = !!(abState.force_before_full || tpState.force_before_full);
+        const abActive = abState.active_group_id ? String(abState.active_group_id) : '';
+        const tpActive = tpState.active_group_id ? String(tpState.active_group_id) : '';
+        const arb = pulseArbiterState;
+        const arbActive = arb && arb.active ? arb.active : null;
+        const displayActiveId = arbActive ? String(arbActive.id)
+            : (abActive || tpActive || '');
+        const displayActiveSource = arbActive ? arbActive.source
+            : (abActive ? 'airband' : (tpActive ? 'tetrapol' : ''));
+        const manualHold = !!(abState.manual_hold || tpState.manual_hold);
+
+        const abListen = new Map((abState.listen_groups || []).map(g => [String(g.group_id), g]));
+        const tpListen = new Map((tpState.listen_groups || []).map(g => [String(g.group_id), g]));
+        const airPulse = [...catalog.values()].filter(e =>
+            e.source === 'airband' && e.meta && e.meta.has_pulse);
+        const tpPulse = [...catalog.values()].filter(e =>
+            e.source === 'tetrapol' && !e.encrypted);
+        const pulseEntries = [...airPulse, ...tpPulse];
+        const structSig = JSON.stringify({
+            e: exclusive,
+            a: displayActiveId,
+            as: displayActiveSource,
+            m: manualHold,
+            f: forceOn,
+            qAb: abState.queue_order || [],
+            qTp: tpState.queue_order || [],
+            pAb: [...(abState.priority_groups || [])].map(String).sort(),
+            pTp: [...(tpState.priority_groups || [])].map(String).sort(),
+            arbA: arbActive ? `${arbActive.source}:${arbActive.id}` : '',
+            arbQ: arb && arb.queue ? arb.queue.map((s) => `${s.source}:${s.id}`).join(',') : '',
+            g: pulseEntries.map(e => {
+                const pe = e.source === 'tetrapol'
+                    ? (tpListen.get(String(e.rawId)) || {})
+                    : (abListen.get(String(e.rawId)) || {});
+                return [
+                    e.key,
+                    (e.meta && e.meta.listen !== false) ? 1 : 0,
+                    e.on_air ? 1 : 0,
+                    isPulsePriority(e.key) ? 1 : 0,
+                    pe.suspended ? 1 : 0,
+                    pe.is_active ? 1 : 0
+                ];
+            })
+        });
+        const fillSig = JSON.stringify(pulseEntries.map(e => {
+            const pe = e.source === 'tetrapol'
+                ? (tpListen.get(String(e.rawId)) || {})
+                : (abListen.get(String(e.rawId)) || {});
+            return [
+                e.key,
+                Math.round((Number(pe.fill_ratio) || 0) * 1000),
+                Math.round((Number(pe.buffer_seconds) || 0) * 10)
+            ];
+        }));
+        const needStruct = structSig !== lastPulseSig;
+        const needFills = fillSig !== lastPulseFillSig;
+        if (!needStruct && !needFills) return;
+        lastPulseSig = structSig;
+        lastPulseFillSig = fillSig;
+
+        const section = document.getElementById('adminPulseAudioSection');
+        if (section) section.style.display = 'block';
+        const toggle = document.getElementById('pulseExclusivePlaybackToggle');
+        const force = document.getElementById('pulseExclusiveForceBufferToggle');
+        const forceCtl = document.getElementById('pulseExclusiveForceBufferControl');
+        const btnBox = document.getElementById('pulseAudioButtonsContainer');
+        const statusPanel = document.getElementById('pulseExclusiveStatusPanel');
+        const summary = document.getElementById('pulseExclusiveStatusSummary');
+        const list = document.getElementById('pulseExclusiveStatusList');
+
+        if (toggle && document.activeElement !== toggle) toggle.checked = exclusive;
+        if (forceCtl) forceCtl.style.display = exclusive ? '' : 'none';
+        if (force && document.activeElement !== force) force.checked = forceOn;
+
+        const uiState = {
+            exclusive,
+            force_before_full: forceOn,
+            manual_hold: manualHold,
+            active_group_id: displayActiveId,
+            active_source: displayActiveSource,
+            buffer_max_seconds: abState.buffer_max_seconds || tpState.buffer_max_seconds || 120,
+            listen_groups: buildStablePulseListenGroups(),
+            queue_order: [
+                ...((abState.queue_order || []).map(String)),
+                ...((tpState.queue_order || []).map(String))
+            ]
+        };
+
+        if (btnBox && needStruct) {
+            const sortedPulse = sortEntriesByGroupNumber(pulseEntries);
+            const wanted = new Set(sortedPulse.map(e => e.key));
+            [...btnBox.querySelectorAll('.pulse-btn')].forEach(btn => {
+                if (!wanted.has(btn.dataset.key)) btn.remove();
+            });
+            sortedPulse.forEach(entry => {
+                const key = entry.key;
+                const gid = String(entry.rawId);
+                const pe = entry.source === 'tetrapol'
+                    ? (tpListen.get(gid) || {})
+                    : (abListen.get(gid) || {});
+                const listening = !(entry.meta && entry.meta.listen === false);
+                const prio = isPulsePriority(key) || !!(pe.priority);
+                let btn = btnBox.querySelector('.pulse-btn[data-key="' + esc(key) + '"]');
+                if (!btn) {
+                    btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'pulse-btn';
+                    btn.dataset.key = key;
+                    btn.dataset.groupId = gid;
+                    btn.dataset.source = entry.source;
+                    const label = document.createElement('span');
+                    label.className = 'pulse-btn-label';
+                    btn.appendChild(label);
+                    const fill = document.createElement('div');
+                    fill.className = 'pulse-btn-fill';
+                    fill.innerHTML = '<div class="pulse-btn-fill-inner"></div>';
+                    btn.appendChild(fill);
+                    bindLongPressPriority(
+                        btn,
+                        () => togglePulsePriority(btn.dataset.key),
+                        async () => {
+                            const id = btn.dataset.groupId;
+                            const src = btn.dataset.source;
+                            if (src === 'airband') {
+                                const ch = airbandById.get(id);
+                                const next = !(ch && ch.listen);
+                                await apiPulseToggle(id, next);
+                                if (ch) ch.listen = next;
+                            } else {
+                                const g = tetrapolGroups.get(String(id));
+                                const next = !(g && g.listen !== false);
+                                await apiTetrapolToggle(id, next);
+                                if (g) g.listen = next;
+                            }
+                            lastPulseSig = '';
+                            lastPulseFillSig = '';
+                            rebuildCatalog();
+                            updatePulseAdmin();
+                        }
+                    );
+                }
+                btnBox.appendChild(btn);
+                const labelEl = btn.querySelector('.pulse-btn-label');
+                if (labelEl) {
+                    const prefix = entry.source === 'tetrapol' ? '📻 ' : '✈️ ';
+                    labelEl.textContent = prefix + labelOf(entry);
+                }
+                btn.classList.toggle('enabled', !!listening);
+                btn.classList.toggle('on-air', !!entry.on_air);
+                btn.classList.toggle('priority', !!prio);
+                const isAct = !!(pe.is_active
+                    || (displayActiveSource === entry.source && displayActiveId === gid));
+                btn.classList.toggle('pulse-active', isAct);
+                const fillInner = btn.querySelector('.pulse-btn-fill-inner');
+                if (fillInner && fillInner.parentElement) {
+                    const pct = Math.max(0, Math.min(100, Math.round((pe.fill_ratio || 0) * 100)));
+                    fillInner.style.width = pct + '%';
+                    fillInner.parentElement.style.display = '';
+                }
+                btn.title = prio
+                    ? 'Priorité Pulse — clic droit / appui long pour retirer'
+                    : ((entry.source === 'tetrapol' ? 'Pulse Tetrapol · ' : 'Pulse Analogique · ')
+                        + gid + (listening ? ' · ON' : ' · OFF'));
+            });
+        } else if (btnBox && needFills) {
+            pulseEntries.forEach((entry) => {
+                const pe = entry.source === 'tetrapol'
+                    ? (tpListen.get(String(entry.rawId)) || {})
+                    : (abListen.get(String(entry.rawId)) || {});
+                const btn = btnBox.querySelector('.pulse-btn[data-key="' + esc(entry.key) + '"]');
+                if (!btn) return;
+                const fillInner = btn.querySelector('.pulse-btn-fill-inner');
+                if (fillInner && fillInner.parentElement) {
+                    const pct = Math.max(0, Math.min(100, Math.round((pe.fill_ratio || 0) * 100)));
+                    fillInner.style.width = pct + '%';
+                    fillInner.parentElement.style.display = '';
+                }
+            });
+        }
+        if (statusPanel && summary && list) {
+            renderPulseExclusiveStatusPanel(uiState, statusPanel, summary, list, needStruct);
+        }
+    }
+
+    function formatPulseBufferSeconds(seconds, maxSec) {
+        const s = Math.max(0, Number(seconds) || 0);
+        const max = Math.max(1, Number(maxSec) || 120);
+        if (s < 1) return `0 / ${max} s`;
+        return `${s.toFixed(s >= 10 ? 0 : 1)} / ${max} s`;
+    }
+
+    function pulseGroupLabel(gid) {
+        const entry = catalog.get(airKey(gid)) || catalog.get(tpKey(gid));
+        if (entry) return labelOf(entry);
+        const ch = airbandById.get(gid);
+        if (ch) return ch.label || gid;
+        const g = tetrapolGroups.get(String(gid));
+        if (g) return g.group_label || gid;
+        return String(gid);
+    }
+
+    function pulseRfsiForGroup(gid) {
+        const channels = tetrapolChannels.filter(c => String(c.group_id) === String(gid));
+        if (!channels.length) return '';
+        const onAir = channels.filter(c => c.on_air).sort((a, b) => (b.last_active_ms || 0) - (a.last_active_ms || 0));
+        const ch = onAir[0] || [...channels].sort((a, b) => (b.last_active_ms || 0) - (a.last_active_ms || 0))[0];
+        if (!ch) return '';
+        const label = (ch.rfsi_label || '').trim();
+        const rfsi = (ch.rfsi || '').trim();
+        if (label && rfsi && label !== rfsi) return `${label} (${rfsi})`;
+        return label || rfsi || '';
+    }
+
+    function buildStablePulseListenGroups() {
+        const abState = pulseExclusiveState || {};
+        const tpState = tpPulseExclusiveState || {};
+        const abTel = {};
+        (abState.listen_groups || []).forEach((g) => {
+            abTel[String(g.group_id)] = g;
+        });
+        const tpTel = {};
+        (tpState.listen_groups || []).forEach((g) => {
+            tpTel[String(g.group_id)] = g;
+        });
+        const abQueue = Array.isArray(abState.queue_order) ? abState.queue_order.map(String) : [];
+        const tpQueue = Array.isArray(tpState.queue_order) ? tpState.queue_order.map(String) : [];
+        const arb = pulseArbiterState;
+        const arbActive = arb && arb.active ? arb.active : null;
+        const abActive = abState.active_group_id ? String(abState.active_group_id) : '';
+        const tpActive = tpState.active_group_id ? String(tpState.active_group_id) : '';
+
+        const rows = [];
+        const seen = new Set();
+
+        [...catalog.values()].filter(e => e.source === 'airband' && e.meta && e.meta.has_pulse).forEach((entry) => {
+            if (entry.meta.listen === false) return;
+            const gid = String(entry.rawId);
+            seen.add('airband:' + gid);
+            const tel = abTel[gid] || {};
+            const isAct = !!(tel.is_active
+                || (arbActive && arbActive.source === 'airband' && String(arbActive.id) === gid)
+                || (!arbActive && gid === abActive));
+            rows.push({
+                group_id: gid,
+                priority: !!(tel.priority || isPulsePriority(airKey(gid))),
+                is_active: isAct,
+                suspended: !!tel.suspended,
+                fill_ratio: Number(tel.fill_ratio) || 0,
+                buffer_seconds: Number(tel.buffer_seconds) || 0,
+                in_queue: !!(tel.in_queue || abQueue.includes(gid)
+                    || (arb && arb.queue && arb.queue.some(s => s.source === 'airband' && String(s.id) === gid))),
+                on_air: !!(tel.on_air || entry.on_air),
+                source: 'airband'
+            });
+        });
+        Object.keys(abTel).forEach((gid) => {
+            if (seen.has('airband:' + gid)) return;
+            const tel = abTel[gid];
+            rows.push({
+                group_id: gid,
+                priority: !!tel.priority,
+                is_active: !!(tel.is_active || (!arbActive && gid === abActive)
+                    || (arbActive && arbActive.source === 'airband' && String(arbActive.id) === gid)),
+                suspended: !!tel.suspended,
+                fill_ratio: Number(tel.fill_ratio) || 0,
+                buffer_seconds: Number(tel.buffer_seconds) || 0,
+                in_queue: !!(tel.in_queue || abQueue.includes(gid)),
+                on_air: !!tel.on_air,
+                source: 'airband'
+            });
+        });
+
+        [...catalog.values()].filter(e => e.source === 'tetrapol' && !e.encrypted).forEach((entry) => {
+            if (entry.meta && entry.meta.listen === false) return;
+            const gid = String(entry.rawId);
+            seen.add('tetrapol:' + gid);
+            const tel = tpTel[gid] || {};
+            const isAct = !!(tel.is_active
+                || (arbActive && arbActive.source === 'tetrapol' && String(arbActive.id) === gid)
+                || (!arbActive && gid === tpActive));
+            rows.push({
+                group_id: gid,
+                priority: !!(tel.priority || isPulsePriority(tpKey(gid))),
+                is_active: isAct,
+                suspended: !!tel.suspended,
+                fill_ratio: Number(tel.fill_ratio) || 0,
+                buffer_seconds: Number(tel.buffer_seconds) || 0,
+                in_queue: !!(tel.in_queue || tpQueue.includes(gid)
+                    || (arb && arb.queue && arb.queue.some(s => s.source === 'tetrapol' && String(s.id) === gid))),
+                on_air: !!(tel.on_air || entry.on_air),
+                source: 'tetrapol'
+            });
+        });
+        Object.keys(tpTel).forEach((gid) => {
+            if (seen.has('tetrapol:' + gid)) return;
+            const tel = tpTel[gid];
+            rows.push({
+                group_id: gid,
+                priority: !!tel.priority,
+                is_active: !!(tel.is_active || (!arbActive && gid === tpActive)
+                    || (arbActive && arbActive.source === 'tetrapol' && String(arbActive.id) === gid)),
+                suspended: !!tel.suspended,
+                fill_ratio: Number(tel.fill_ratio) || 0,
+                buffer_seconds: Number(tel.buffer_seconds) || 0,
+                in_queue: !!(tel.in_queue || tpQueue.includes(gid)),
+                on_air: !!tel.on_air,
+                source: 'tetrapol'
+            });
+        });
+
+        rows.sort((a, b) => {
+            if (a.source !== b.source) return a.source === 'airband' ? -1 : 1;
+            return String(a.group_id).localeCompare(String(b.group_id), undefined, { numeric: true });
+        });
+        return rows;
+    }
+
+    function ensurePulseExclusivePanelDelegation(panel) {
+        if (!panel || pulsePanelDelegated) return;
+        pulsePanelDelegated = true;
+        panel.addEventListener('click', async (e) => {
+            const btn = e.target && e.target.closest ? e.target.closest('[data-pulse-action]') : null;
+            if (!btn || !panel.contains(btn)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (pulseControlInFlight) return;
+            const action = btn.getAttribute('data-pulse-action');
+            const gid = btn.getAttribute('data-group-id') || '';
+            const src = btn.getAttribute('data-source') || resolvePulseSource(gid);
+            lastPulseSig = '';
+            lastPulseFillSig = '';
+            pulseLocalEditUntil = Date.now() + 2000;
+            pulseControlInFlight = true;
+
+            const prevAb = pulseExclusiveState && typeof pulseExclusiveState === 'object'
+                ? pulseExclusiveState : {};
+            const prevTp = tpPulseExclusiveState && typeof tpPulseExclusiveState === 'object'
+                ? tpPulseExclusiveState : {};
+            if (action === 'stop') {
+                pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: true };
+                tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: true };
+                updatePulseAdmin();
+            } else if (action === 'auto') {
+                pulseExclusiveState = { ...prevAb, manual_hold: false };
+                tpPulseExclusiveState = { ...prevTp, manual_hold: false };
+                updatePulseAdmin();
+            } else if (action === 'play' && gid) {
+                if (src === 'tetrapol') {
+                    tpPulseExclusiveState = { ...prevTp, active_group_id: gid, manual_hold: true };
+                    pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: true };
+                } else {
+                    pulseExclusiveState = { ...prevAb, active_group_id: gid, manual_hold: true };
+                    tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: true };
+                }
+                updatePulseAdmin();
+            } else if (action === 'clear' && gid) {
+                const clearListen = (prev) => {
+                    const listen = Array.isArray(prev.listen_groups)
+                        ? prev.listen_groups.map((g) => {
+                            if (String(g.group_id) !== String(gid)) return g;
+                            return { ...g, fill_ratio: 0, buffer_seconds: 0 };
+                        })
+                        : prev.listen_groups;
+                    const fills = { ...(prev.fill_ratios || {}) };
+                    fills[gid] = 0;
+                    return { ...prev, listen_groups: listen, fill_ratios: fills };
+                };
+                if (src === 'tetrapol') tpPulseExclusiveState = clearListen(prevTp);
+                else pulseExclusiveState = clearListen(prevAb);
+                updatePulseAdmin();
+            }
+
+            try {
+                const arbOn = !!(pulseArbiterState && pulseArbiterState.enabled !== false
+                    && (pulseExclusiveState.exclusive || tpPulseExclusiveState.exclusive));
+                let result = null;
+                if (arbOn) {
+                    if (action === 'stop') {
+                        result = await apiPulseArbiter('stop');
+                    } else if (action === 'auto') {
+                        result = await apiPulseArbiter('auto');
+                    } else if (action === 'play' && gid) {
+                        result = await apiPulseArbiter('play', { source: src, id: gid });
+                    } else if (action === 'clear' && gid) {
+                        result = await apiPulseArbiter('clear', { source: src, id: gid });
+                    }
+                    if (result && result.arbiter) pulseArbiterState = result.arbiter;
+                } else if (src === 'tetrapol') {
+                    if (action === 'stop') {
+                        result = await apiTetrapolPulseExclusive({
+                            yield_active: true, active_group_id: '', manual_hold: true
+                        });
+                    } else if (action === 'auto') {
+                        result = await apiTetrapolPulseExclusive({ manual_hold: false });
+                    } else if (action === 'play' && gid) {
+                        result = await apiTetrapolPulseExclusive({
+                            active_group_id: gid, manual_hold: true
+                        });
+                    } else if (action === 'clear' && gid) {
+                        result = await apiTetrapolPulseExclusive({ clear_buffer: gid });
+                    }
+                    if (result) tpPulseExclusiveState = { ...tpPulseExclusiveState, ...result };
+                } else {
+                    if (action === 'stop') {
+                        result = await apiPulseExclusive({ stop_active: true, manual_hold: true });
+                    } else if (action === 'auto') {
+                        result = await apiPulseExclusive({ manual_hold: false });
+                    } else if (action === 'play' && gid) {
+                        result = await apiPulseExclusive({
+                            active_group_id: gid, manual_hold: true
+                        });
+                    } else if (action === 'clear' && gid) {
+                        result = await apiPulseExclusive({ clear_buffer: gid });
+                    }
+                    if (result) pulseExclusiveState = { ...pulseExclusiveState, ...result };
+                }
+                pulseLocalEditUntil = Date.now() + 1500;
+                updatePulseAdmin();
+            } finally {
+                pulseControlInFlight = false;
+            }
+        });
+    }
+
+    function renderPulseExclusiveStatusPanel(state, panel, summaryEl, listEl, rebuildStruct = true) {
+        const exclusive = !!state.exclusive;
+        const maxSec = state.buffer_max_seconds || 120;
+        const atRiskRatio = 0.80;
+        const forceRatio = 0.92;
+        const activeId = state.active_group_id ? String(state.active_group_id) : '';
+        const activeSource = state.active_source || '';
+        const manualHold = !!state.manual_hold;
+        const forceOn = !!state.force_before_full;
+
+        panel.style.display = '';
+        ensurePulseExclusivePanelDelegation(panel);
+
+        if (!exclusive) {
+            summaryEl.innerHTML =
+                '<span class="pulse-mode-badge parallel">Mode parallèle</span> '
+                + 'Tous les groupes activés écoutent simultanément sur PulseAudio.';
+            listEl.innerHTML = '';
+            return;
+        }
+
+        const listenGroups = Array.isArray(state.listen_groups)
+            ? state.listen_groups
+            : buildStablePulseListenGroups();
+
+        const patchRowFill = (row, g) => {
+            let fill = Number(g.fill_ratio);
+            if (!Number.isFinite(fill)) fill = 0;
+            if (fill > 1) fill = fill / 100;
+            fill = Math.min(1, Math.max(0, fill));
+            let bufSec = Number(g.buffer_seconds);
+            if (!Number.isFinite(bufSec)) bufSec = 0;
+            if (bufSec > 0 && maxSec > 0) fill = Math.min(fill, bufSec / maxSec);
+            const pct = Math.round(fill * 100);
+            const atRisk = fill >= atRiskRatio;
+            const forceSoon = fill >= forceRatio;
+            const gid = String(g.group_id);
+            const isActive = !!(g.is_active || (gid === activeId && (!activeSource || g.source === activeSource)));
+            const onAir = !!g.on_air;
+            row.classList.toggle('pulse-fill-active', isActive);
+            row.classList.toggle('pulse-fill-at-risk', atRisk);
+            row.classList.toggle('pulse-fill-on-air', onAir);
+            const meter = row.querySelector('.pulse-fill-meter');
+            if (meter) {
+                meter.classList.toggle('pulse-fill-meter-risk', atRisk);
+                const inner = meter.querySelector('.pulse-fill-bar-inner');
+                if (inner) inner.style.width = pct + '%';
+                const timeEl = meter.querySelector('.pulse-fill-time');
+                if (timeEl) timeEl.textContent = formatPulseBufferSeconds(bufSec, maxSec);
+                const pctEl = meter.querySelector('.pulse-fill-pct');
+                if (pctEl) pctEl.textContent = pct + ' %';
+            }
+            const badges = row.querySelector('.pulse-fill-badges');
+            if (badges) {
+                let html = '';
+                if (isActive) html += '<span class="pulse-fill-badge active">ACTIF</span>';
+                else if (g.in_queue) html += '<span class="pulse-fill-badge queue" title="En file d\'attente">FILE</span>';
+                if (g.priority) html += '<span class="pulse-fill-badge priority">PRIO</span>';
+                if (g.suspended) html += '<span class="pulse-fill-badge suspended">PAUSE</span>';
+                if (onAir) html += '<span class="pulse-fill-badge on-air">ON AIR</span>';
+                if (forceSoon && !isActive) html += '<span class="pulse-fill-badge force">≥92%</span>';
+                badges.innerHTML = html;
+            }
+        };
+
+        if (!rebuildStruct) {
+            listenGroups.forEach((g) => {
+                const row = listEl.querySelector(
+                    '.pulse-fill-row[data-source="' + cssEscapeAttr(g.source) + '"][data-group-id="'
+                    + cssEscapeAttr(String(g.group_id)) + '"]'
+                );
+                if (row) patchRowFill(row, g);
+            });
+            return;
+        }
+
+        const activeLabel = activeId ? pulseGroupLabel(activeId) : null;
+        let summaryHtml = '<span class="pulse-mode-badge">File exclusive</span> ';
+        if (manualHold) {
+            summaryHtml += '<span class="pulse-fill-badge suspended">MANUEL</span> ';
+        }
+        if (activeId) {
+            const rfsiText = activeSource === 'tetrapol' ? pulseRfsiForGroup(activeId) : '';
+            const srcBadge = activeSource === 'tetrapol' ? 'TP' : (activeSource === 'airband' ? 'AB' : '');
+            summaryHtml += '<div class="pulse-active-block">';
+            summaryHtml += '<div class="pulse-active-main">';
+            summaryHtml += '<div class="pulse-active-line">'
+                + '<span class="pulse-active-prefix">▶ En lecture :</span> '
+                + (srcBadge ? `<span class="pulse-mode-badge">${srcBadge}</span> ` : '')
+                + `<span class="pulse-active-name" title="${escHtml(activeLabel)} (#${escHtml(activeId)})">${escHtml(activeLabel)}</span> `
+                + `<span class="pulse-active-id">(#${escHtml(activeId)})</span>`
+                + '</div>';
+            if (rfsiText) {
+                summaryHtml += `<div class="pulse-active-rfsi" title="RFSI">${escHtml(rfsiText)}</div>`;
+            }
+            summaryHtml += '</div>';
+            summaryHtml += '<div class="pulse-active-actions">';
+            summaryHtml += '<button type="button" class="pulse-manual-btn pulse-stop-btn" data-pulse-action="stop" title="Arrêter la lecture Pulse (sans relance auto)">⏹ Stop</button>';
+            summaryHtml += `<button type="button" class="pulse-manual-btn pulse-clear-btn" data-pulse-action="clear" data-group-id="${escHtml(activeId)}" data-source="${escHtml(activeSource || 'airband')}" title="Vider le tampon et revenir au direct">✕</button>`;
+            summaryHtml += '</div></div>';
+        } else {
+            summaryHtml += '▶ Aucun groupe actif (en attente de PCM ou fin de transmission) ';
+        }
+        if (manualHold) {
+            summaryHtml += '<button type="button" class="pulse-manual-btn" data-pulse-action="auto" title="Reprendre la file automatique">↻ Auto</button> ';
+        }
+        if (forceOn) {
+            summaryHtml += ` · ⚡ Bascule tampon ≥ ${Math.round(forceRatio * 100)} %`;
+        }
+        if (pulseArbiterState && pulseArbiterState.enabled
+            && (pulseArbiterState.active || (pulseArbiterState.queue && pulseArbiterState.queue.length))) {
+            const a = pulseArbiterState.active;
+            const q = pulseArbiterState.queue || [];
+            const srcLabel = (s) => (s === 'tetrapol' ? 'TP' : 'AB');
+            summaryHtml += '<div class="pulse-arbiter-line" title="File Pulse unifiée Airband + Tetrapol">';
+            summaryHtml += '<span class="pulse-mode-badge">File unifiée</span> ';
+            if (a) {
+                summaryHtml += `▶ ${srcLabel(a.source)} #${escHtml(String(a.id))}`;
+                if (a.priority) summaryHtml += ' ★';
+            } else {
+                summaryHtml += '▶ —';
+            }
+            if (q.length) {
+                summaryHtml += ' · file: ' + q.map((s, i) =>
+                    `${i + 1}. ${srcLabel(s.source)} #${escHtml(String(s.id))}${s.priority ? '★' : ''}`
+                ).join(' → ');
+            }
+            summaryHtml += '</div>';
+        }
+        summaryEl.innerHTML = summaryHtml;
+
+        if (!listenGroups.length) {
+            listEl.innerHTML = '<div class="pulse-fill-empty">Aucun groupe activé pour PulseAudio.</div>';
+            return;
+        }
+
+        listEl.innerHTML = '';
+        listenGroups.forEach((g) => {
+            const gid = String(g.group_id);
+            const src = g.source || 'airband';
+            let fill = Number(g.fill_ratio);
+            if (!Number.isFinite(fill)) fill = 0;
+            if (fill > 1) fill = fill / 100;
+            fill = Math.min(1, Math.max(0, fill));
+            let bufSec = Number(g.buffer_seconds);
+            if (!Number.isFinite(bufSec)) bufSec = 0;
+            if (bufSec > 0 && maxSec > 0) fill = Math.min(fill, bufSec / maxSec);
+            const pct = Math.round(fill * 100);
+            const atRisk = fill >= atRiskRatio;
+            const forceSoon = fill >= forceRatio;
+            const isActive = !!(g.is_active || (gid === activeId && (!activeSource || src === activeSource)));
+            const rfsiText = src === 'tetrapol' ? pulseRfsiForGroup(gid) : '';
+            const groupLabel = pulseGroupLabel(gid);
+            const onAir = !!g.on_air;
+
+            const row = document.createElement('div');
+            row.className = 'pulse-fill-row'
+                + (isActive ? ' pulse-fill-active' : '')
+                + (atRisk ? ' pulse-fill-at-risk' : '')
+                + (onAir ? ' pulse-fill-on-air' : '');
+            row.dataset.groupId = gid;
+            row.dataset.source = src;
+
+            const playSlot = document.createElement('div');
+            playSlot.className = 'pulse-fill-play-slot';
+            if (isActive) {
+                playSlot.innerHTML = '<span class="pulse-fill-active-icon" title="En lecture" aria-hidden="true">▶</span>';
+            } else {
+                const playBtn = document.createElement('button');
+                playBtn.type = 'button';
+                playBtn.className = 'pulse-manual-btn pulse-fill-play-btn';
+                playBtn.title = 'Lancer ce groupe sur PulseAudio maintenant';
+                playBtn.setAttribute('data-pulse-action', 'play');
+                playBtn.setAttribute('data-group-id', gid);
+                playBtn.setAttribute('data-source', src);
+                playBtn.textContent = '▶';
+                playSlot.appendChild(playBtn);
+            }
+
+            const main = document.createElement('div');
+            main.className = 'pulse-fill-main';
+            const titleRow = document.createElement('div');
+            titleRow.className = 'pulse-fill-title-row';
+            const name = document.createElement('div');
+            name.className = 'pulse-fill-name';
+            name.textContent = (src === 'tetrapol' ? '📻 ' : '✈️ ') + groupLabel;
+            name.title = `Groupe ${gid}`;
+            const idEl = document.createElement('span');
+            idEl.className = 'pulse-fill-id';
+            idEl.textContent = `#${gid}`;
+            titleRow.appendChild(name);
+            titleRow.appendChild(idEl);
+            if (bufSec > 0.15 || pct > 0) {
+                const clearBtn = document.createElement('button');
+                clearBtn.type = 'button';
+                clearBtn.className = 'pulse-manual-btn pulse-clear-btn pulse-fill-clear-btn';
+                clearBtn.title = 'Vider le tampon et revenir au direct';
+                clearBtn.setAttribute('data-pulse-action', 'clear');
+                clearBtn.setAttribute('data-group-id', gid);
+                clearBtn.setAttribute('data-source', src);
+                clearBtn.textContent = '✕';
+                titleRow.appendChild(clearBtn);
+            }
+            main.appendChild(titleRow);
+            const rfsiEl = document.createElement('div');
+            rfsiEl.className = 'pulse-fill-rfsi' + (rfsiText ? '' : ' pulse-fill-rfsi-empty');
+            rfsiEl.textContent = rfsiText || '—';
+            main.appendChild(rfsiEl);
+
+            const badges = document.createElement('div');
+            badges.className = 'pulse-fill-badges';
+            if (isActive) badges.innerHTML += '<span class="pulse-fill-badge active">ACTIF</span>';
+            else if (g.in_queue) badges.innerHTML += '<span class="pulse-fill-badge queue" title="En file d\'attente">FILE</span>';
+            if (g.priority) badges.innerHTML += '<span class="pulse-fill-badge priority">PRIO</span>';
+            if (g.suspended) badges.innerHTML += '<span class="pulse-fill-badge suspended">PAUSE</span>';
+            if (onAir) badges.innerHTML += '<span class="pulse-fill-badge on-air">ON AIR</span>';
+            if (forceSoon && !isActive) badges.innerHTML += '<span class="pulse-fill-badge force">≥92%</span>';
+
+            const meter = document.createElement('div');
+            meter.className = 'pulse-fill-meter' + (atRisk ? ' pulse-fill-meter-risk' : '');
+            meter.innerHTML =
+                `<div class="pulse-fill-bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">`
+                + `<div class="pulse-fill-bar-inner" style="width:${pct}%"></div></div>`
+                + `<div class="pulse-fill-meter-meta">`
+                + `<span class="pulse-fill-time">${escHtml(formatPulseBufferSeconds(bufSec, maxSec))}</span>`
+                + `<span class="pulse-fill-pct">${pct} %</span>`
+                + `</div>`;
+
+            row.appendChild(playSlot);
+            row.appendChild(main);
+            row.appendChild(badges);
+            row.appendChild(meter);
+            listEl.appendChild(row);
+        });
+    }
+
+    function wirePulseAdminControls() {
+        const toggle = document.getElementById('pulseExclusivePlaybackToggle');
+        const force = document.getElementById('pulseExclusiveForceBufferToggle');
+        if (toggle && !toggle.dataset.bound) {
+            toggle.dataset.bound = '1';
+            toggle.addEventListener('change', () => {
+                lastPulseSig = '';
+                apiPulseExclusiveBoth({
+                    exclusive: toggle.checked,
+                    force_before_full: force ? force.checked : true
+                });
+            });
+        }
+        if (force && !force.dataset.bound) {
+            force.dataset.bound = '1';
+            force.addEventListener('change', () => {
+                lastPulseSig = '';
+                // Always send both flags so the peer cannot keep a stale force value
+                // while exclusive is inferred from a partial POST.
+                apiPulseExclusiveBoth({
+                    exclusive: toggle ? toggle.checked : true,
+                    force_before_full: force.checked
+                });
+            });
+        }
+        // Pas de redémarrage mixer Tetrapol côté Airband
+        const restart = document.getElementById('restartMixerBtn');
+        if (restart) restart.style.display = 'none';
+        checkAdminMode();
+    }
+
+    function checkAdminMode() {
+        isAdminMode = isAdminPage || window.location.hash.includes('admin');
+        const pulse = document.getElementById('adminPulseAudioSection');
+        const reload = document.getElementById('adminReloadSection');
+        if (pulse) pulse.style.display = isAdminMode ? 'block' : 'none';
+        if (reload) reload.style.display = isAdminMode ? 'block' : 'none';
+        if (isAdminMode) {
+            lastPulseSig = '';
+            updatePulseAdmin(pulseExclusiveState);
+        }
+    }
+
+    /* ---- WS handlers ---- */
+
+    function applyTetrapolFromBridge(tp) {
+        if (!tp) return;
+        if (el.tetrapolSection) {
+            el.tetrapolSection.style.display = (tp.connected || tetrapolWsUrl) ? 'block' : el.tetrapolSection.style.display;
+        }
+        const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
+        if (tpTitle && (tp.connected || tetrapolWsUrl)) tpTitle.style.display = '';
+        tetrapolBridged = !!tp.connected;
+        if (!tp.connected) {
+            // Keep last-known cells visible but force KO (like tetrapol-kit timeout).
+            tetrapolCells.forEach((c) => {
+                if (c.syncStatus !== 'lost') c.syncStatus = 'unsynced';
+            });
+            tetrapolChannels = [];
+        } else {
+            const chObj = tp.channels || {};
+            tetrapolChannels = chObj.channels || (Array.isArray(chObj) ? chObj : []);
+        }
+        const grObj = tp.groups || {};
+        const groups = (!tp.connected) ? [] : (grObj.groups || (Array.isArray(grObj) ? grObj : []));
+        tetrapolGroups = new Map(groups.map(g => [String(g.group_id), Object.assign({}, g, {
+            listen: g.listen !== false,
+            encrypted: !!g.encrypted
+        })]));
+        tetrapolChannels.forEach(c => {
+            if (c.group_id == null) return;
+            const gid = String(c.group_id);
+            if (!tetrapolGroups.has(gid)) {
+                tetrapolGroups.set(gid, {
+                    group_id: gid,
+                    group_label: c.group_label || gid,
+                    on_air: !!c.on_air,
+                    encrypted: !!c.encrypted,
+                    listen: true
+                });
+            } else if (c.encrypted) {
+                tetrapolGroups.get(gid).encrypted = true;
+            }
+        });
+        scanTetrapolClearGroups();
+        const cellsRaw = tp.cells;
+        const cellsList = Array.isArray(cellsRaw) ? cellsRaw
+            : (cellsRaw && Array.isArray(cellsRaw.cells) ? cellsRaw.cells : []);
+        if (cellsList.length) applyTetrapolCellsSnapshot(cellsList);
+        if (!tp.connected) markAllCellsUnsynced('disconnect');
+        if (tp.pulse_exclusive) {
+            tpPulseExclusiveState = tp.pulse_exclusive;
+            applyTetrapolPulsePriorities(tp.pulse_exclusive);
+        }
+        lastTpSig = '';
+        lastReceptionSig = '';
+        rebuildCatalog();
+        updateTetrapolListing();
+        updateReceptionDisplay();
+        setDot(el.tetrapolStatus, tetrapolBridged && (
+            tetrapolChannels.some(c => c.on_air) || [...tetrapolGroups.values()].some(g => g.on_air)
+        ));
+        if (!tetrapolBridged && el.tetrapolStatus) {
+            setDot(el.tetrapolStatus, false);
+        }
+    }
+
+    function refreshExclusiveSegmentEntries() {
+        exclusiveQueue.forEach((seg) => {
+            const entry = catalog.get(seg.key);
+            if (entry) seg.entry = entry;
+            syncRingBufferTitleDisplay(seg);
+        });
+        if (exclusiveActive) {
+            const entry = catalog.get(exclusiveActive.key);
+            if (entry) exclusiveActive.entry = entry;
+            syncRingBufferTitleDisplay(exclusiveActive);
+        }
+    }
+
+    function stopAirbandStreamsOnly() {
+        const keys = new Set();
+        players.forEach((p, key) => {
+            if ((p.entry && p.entry.source === 'airband') || String(key).startsWith('ab:')) keys.add(key);
+        });
+        exclusiveQueue.forEach((s) => {
+            if ((s.entry && s.entry.source === 'airband') || String(s.key).startsWith('ab:')) keys.add(s.key);
+        });
+        if (exclusiveActive && ((exclusiveActive.entry && exclusiveActive.entry.source === 'airband')
+            || String(exclusiveActive.key).startsWith('ab:'))) {
+            keys.add(exclusiveActive.key);
+        }
+        keys.forEach((key) => {
+            try { stopEntry(key); } catch (_) { /* ignore */ }
+        });
+    }
+
+    function markAirbandOffline() {
+        airbandBridged = false;
+        stopAirbandStreamsOnly();
+        const inactiveListing = [...airbandById.values()].map((ch) => ({
+            ...ch,
+            on_air: false,
+            last_close_ms: ch.last_close_ms || Date.now()
+        }));
+        airbandById = new Map(inactiveListing.map((c) => [c.stream_id, c]));
+        rebuildCatalog();
+        pulseExclusiveState = {};
+        lastAirSig = '\0';
+        lastAirBtnSig = '';
+        lastReceptionSig = '';
+        setDot(el.channelsStatus, false);
+        updateAirbandTable(inactiveListing.length ? inactiveListing : []);
+        updateAirbandButtons();
+        updateReceptionDisplay();
+    }
+
+    function onMonitorUpdate(msg) {
+        const wasAirband = airbandBridged;
+        if (msg.sources) {
+            if (msg.sources.airband != null) airbandBridged = !!msg.sources.airband;
+            if (msg.sources.tetrapol != null) tetrapolBridged = !!msg.sources.tetrapol;
+        }
+        if (msg.config) {
+            if (msg.config.icecast_public_base != null) icecastPublicBase = msg.config.icecast_public_base;
+            if (msg.config.tetrapol_ws_url != null) tetrapolWsUrl = msg.config.tetrapol_ws_url;
+            if (msg.config.tetrapol_bridged != null) tetrapolBridged = !!msg.config.tetrapol_bridged;
+            if (msg.config.airband_bridged != null) airbandBridged = !!msg.config.airband_bridged;
+            if (tetrapolWsUrl && el.tetrapolSection) el.tetrapolSection.style.display = 'block';
+            const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
+            if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
+        }
+
+        if (wasAirband && !airbandBridged) {
+            markAirbandOffline();
+        } else if (airbandBridged) {
+            const channels = (msg.channels && msg.channels.channels) || [];
+            airbandById = new Map(channels.map(c => [c.stream_id, c]));
+            updateAirbandTable(channels);
+        }
+
+        if (msg.tetrapol) applyTetrapolFromBridge(msg.tetrapol);
+        rebuildCatalog();
+        refreshExclusiveSegmentEntries();
+        updateAirbandButtons();
+        updateReceptionDisplay();
+        syncPlayersFromCatalog();
+        if (msg.pulse_arbiter) pulseArbiterState = msg.pulse_arbiter;
+        if (airbandBridged && msg.pulse_exclusive) {
+            const remote = msg.pulse_exclusive;
+            if (Date.now() < pulseLocalEditUntil && pulseExclusiveState) {
+                pulseExclusiveState = {
+                    ...remote,
+                    active_group_id: pulseExclusiveState.active_group_id,
+                    manual_hold: pulseExclusiveState.manual_hold
+                };
+            } else {
+                pulseExclusiveState = remote;
+            }
+        } else if (!airbandBridged) {
+            pulseExclusiveState = {};
+        }
+        if (msg.tetrapol && msg.tetrapol.pulse_exclusive) {
+            const remoteTp = msg.tetrapol.pulse_exclusive;
+            if (Date.now() < pulseLocalEditUntil && tpPulseExclusiveState) {
+                tpPulseExclusiveState = {
+                    ...remoteTp,
+                    active_group_id: tpPulseExclusiveState.active_group_id,
+                    manual_hold: tpPulseExclusiveState.manual_hold
+                };
+            } else {
+                tpPulseExclusiveState = remoteTp;
+            }
+        }
+        updatePulseAdmin();
+        setDot(el.channelsStatus, airbandBridged && [...airbandById.values()].some(c => c.on_air));
+        if (el.connectionStatus) {
+            const ab = airbandBridged
+                ? `Analogique OK (${airbandById.size})`
+                : 'Analogique déconnecté';
+            let tp = '';
+            if (tetrapolWsUrl) {
+                tp = tetrapolBridged ? ' · Tetrapol OK' : ' · Tetrapol déconnecté';
+            }
+            el.connectionStatus.textContent = ab + tp;
+            el.connectionStatus.style.color = (!airbandBridged || (tetrapolWsUrl && !tetrapolBridged))
+                ? '#c66'
+                : '';
+        }
+    }
+
+    function connectLocal() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        ws = new WebSocket(WS_URL);
+        ws.onopen = () => {
+            wsRetries = 0;
+            // Local bridge is up; upstream Airband/Tetrapol status comes from updates.
+            if (el.connectionStatus) el.connectionStatus.textContent = 'Bridge OK — attente sources…';
+        };
+        ws.onclose = () => {
+            markAirbandOffline();
+            tetrapolBridged = false;
+            if (el.tetrapolStatus) setDot(el.tetrapolStatus, false);
+            if (el.connectionStatus) {
+                el.connectionStatus.textContent = 'Monitor déconnecté';
+                el.connectionStatus.style.color = '#c66';
+            }
+            if (wsRetries < 10) {
+                wsRetries++;
+                setTimeout(connectLocal, 1000 * wsRetries);
+            }
+        };
+        ws.onerror = (err) => {
+            console.warn('WS error', err);
+        };
+        ws.onmessage = (ev) => {
+            try {
+                const msg = JSON.parse(ev.data);
+                if (msg.type === 'update') {
+                    onMonitorUpdate(msg);
+                    return;
+                }
+                if (msg.event && handleTetrapolCellEvent(msg))
+                    return;
+            } catch (e) {
+                console.warn('WS JSON parse failed', e);
+            }
+        };
+    }
+
+    function wireCollapsible() {
+        document.querySelectorAll('.section-toggle').forEach(toggle => {
+            toggle.addEventListener('click', () => {
+                const expanded = toggle.getAttribute('aria-expanded') !== 'false';
+                toggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+                const body = document.getElementById(toggle.getAttribute('aria-controls'));
+                if (body) body.style.display = expanded ? 'none' : '';
+            });
+        });
+    }
+
+    function wireAudioControls() {
+        if (el.activateAudio) {
+            el.activateAudio.addEventListener('click', () => {
+                audioEnabled = true;
+                el.activateAudio.style.display = 'none';
+                const buttonSection = el.activateAudio.closest('.section')
+                    || document.getElementById('activateAudioSection');
+                if (buttonSection) buttonSection.style.display = 'none';
+                lastAirBtnSig = '';
+                lastTpSig = '';
+                updateAirbandButtons();
+                updateTetrapolListing();
+                ensureStreamsSection();
+                syncPlayersFromCatalog();
+            });
+        }
+        if (el.exclusiveToggle) {
+            el.exclusiveToggle.checked = exclusivePlaybackMode;
+            if (el.exclusiveForceControl) el.exclusiveForceControl.style.display = exclusivePlaybackMode ? '' : 'none';
+            el.exclusiveToggle.addEventListener('change', () => {
+                exclusivePlaybackMode = el.exclusiveToggle.checked;
+                localStorage.setItem('exclusivePlaybackMode', exclusivePlaybackMode);
+                if (el.exclusiveForceControl) el.exclusiveForceControl.style.display = exclusivePlaybackMode ? '' : 'none';
+                [...players.keys()].forEach(stopEntry);
+                exclusiveQueue.forEach(cleanupExclusive);
+                exclusiveQueue = [];
+                exclusiveActive = null;
+                if (audioEnabled) syncPlayersFromCatalog();
+            });
+        }
+        if (el.exclusiveForceToggle) {
+            el.exclusiveForceToggle.checked = forceBeforeFull;
+            el.exclusiveForceToggle.addEventListener('change', () => {
+                forceBeforeFull = el.exclusiveForceToggle.checked;
+                localStorage.setItem('exclusiveForceBeforeBufferFull', forceBeforeFull);
+            });
+        }
+        if (el.volumeSlider) {
+            el.volumeSlider.value = globalVolume;
+            if (el.volumeValue) el.volumeValue.textContent = globalVolume + '%';
+            el.volumeSlider.addEventListener('input', () => {
+                globalVolume = parseInt(el.volumeSlider.value, 10);
+                localStorage.setItem('globalVolume', String(globalVolume));
+                if (el.volumeValue) el.volumeValue.textContent = globalVolume + '%';
+                players.forEach(p => { const a = getAudio(p); if (a) a.volume = globalVolume / 100; });
+                const allEx = [...exclusiveQueue];
+                if (exclusiveActive) allEx.push(exclusiveActive);
+                allEx.forEach((seg) => {
+                    if (seg.queueAudioEl) seg.queueAudioEl.volume = globalVolume / 100;
+                    if (seg.playbackPlayer?.audioElement) {
+                        seg.playbackPlayer.audioElement.volume = globalVolume / 100;
+                    }
+                });
+            });
+        }
+    }
+
+    async function loadConfig() {
+        try {
+            // Monitor-side public Icecast base (preferred) — then Airband config fallback.
+            try {
+                const mr = await fetch('/api/monitor/config');
+                const mcfg = await mr.json();
+                if (mcfg && mcfg.icecast_public_base) {
+                    icecastPublicBase = String(mcfg.icecast_public_base);
+                }
+                window.__ICECAST_BROWSER_DIRECT__ = !!(mcfg && mcfg.icecast_browser_direct);
+            } catch (_) { /* optional */ }
+
+            const r = await fetch('/api/airband/config');
+            const cfg = await r.json();
+            if (!icecastPublicBase) icecastPublicBase = cfg.icecast_public_base || '';
+            tetrapolWsUrl = cfg.tetrapol_ws_url || '';
+            tetrapolBridged = !!cfg.tetrapol_bridged;
+            if (tetrapolWsUrl && el.tetrapolSection) el.tetrapolSection.style.display = 'block';
+            const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
+            if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
+        } catch (e) {
+            console.warn('config fetch failed', e);
+        }
+    }
+
+    function loadIcecastLib(cb) {
+        if (typeof IcecastMetadataPlayer !== 'undefined' || isAdminPage) return cb();
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/icecast-metadata-player@1.17.13/build/icecast-metadata-player-1.17.13.main.min.js';
+        s.onload = cb;
+        s.onerror = cb;
+        document.head.appendChild(s);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        wireCollapsible();
+        wireAudioControls();
+        setInterval(checkCellInfoTimeouts, 5000);
+        loadDepartments();
+        if (window.AdminPanel) {
+            AdminPanel.mount().then(() => wirePulseAdminControls()).catch(() => {});
+        }
+        document.addEventListener('admin-panel-ready', () => wirePulseAdminControls());
+        window.addEventListener('hashchange', () => {
+            checkAdminMode();
+            refreshDebugMode();
+        });
+        checkAdminMode();
+        refreshDebugMode();
+        loadConfig().then(() => {
+            updateTetrapolListing();
+            loadIcecastLib(() => connectLocal());
+        });
+    });
+})();

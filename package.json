@@ -1,0 +1,18 @@
+{
+  "name": "airband-tetrapol-monitor",
+  "version": "1.0.0",
+  "description": "Unified monitor aggregating RTLSDR-Airband and Tetrapol WebSocket feeds",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "ws": "^8.18.0"
+  }
+}

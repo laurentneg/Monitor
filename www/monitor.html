@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="description" content="Monitor Analogique + Tetrapol — listing et streaming">
+    <meta name="theme-color" content="#44aaff">
+    <title>Analogique + Tetrapol Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+</head>
+
+<body>
+    <h1>🎧 Analogique + Tetrapol Monitor</h1>
+    <nav class="admin-page-nav" style="text-align:center; margin-bottom: 1em;">
+        <a href="/">🛠️ Admin</a>
+    </nav>
+
+    <!-- Listes transmissions (repliables) en haut de page -->
+    <div class="section section-collapsible" id="receptionSection">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="receptionSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            📡 Réception (cellules & devices)
+        </h2>
+        <div class="section-collapsible-body" id="receptionSectionBody">
+            <div id="receptionContainer" class="cells-grid">
+                <div class="no-data">Aucune réception détectée</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section section-collapsible" id="channelsSection">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="channelsSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            <span class="status-indicator" id="channelsStatusIndicator"></span>
+            📡 Transmissions Analogique
+        </h2>
+        <div class="section-collapsible-body" id="channelsSectionBody">
+            <div class="table-container">
+                <table id="channelsTable">
+                    <thead>
+                        <tr>
+                            <th>Device</th>
+                            <th>Canal</th>
+                            <th>Fréquence</th>
+                            <th>Mode</th>
+                            <th>Label</th>
+                            <th>État</th>
+                        </tr>
+                    </thead>
+                    <tbody id="channelsTableBody">
+                        <tr><td colspan="6" class="no-data">Chargement...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="section section-collapsible" id="tetrapolSection" style="display: none;">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="tetrapolSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            <span class="status-indicator" id="tetrapolStatusIndicator"></span>
+            📻 Transmissions Tetrapol
+        </h2>
+        <div class="section-collapsible-body" id="tetrapolSectionBody">
+            <div class="table-container">
+                <table id="tetrapolChannelsTable">
+                    <thead>
+                        <tr>
+                            <th>Cellule</th>
+                            <th>Channel</th>
+                            <th>Group</th>
+                            <th>Label</th>
+                            <th>RFSI</th>
+                            <th>RFSI Label</th>
+                            <th>État</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tetrapolChannelsBody">
+                        <tr><td colspan="7" class="no-data">Non connecté</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Streaming -->
+    <div class="section" id="activateAudioSection" style="text-align: center; padding: 1em;">
+        <button id="activateAudio" style="padding: 0.8em 2em; background: rgb(68, 170, 68); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 1em; font-weight: bold;">
+            🔊 Activer l'audio (Analogique + Tetrapol)
+        </button>
+        <div id="connectionStatus" class="admin-action-status" style="margin-top: 0.5em;">Connexion…</div>
+    </div>
+
+    <!-- Groupes : visibles seulement après « Activer l'audio », indépendants des listes transmissions -->
+    <div class="section section-collapsible" id="groupButtonsSection" style="display: none;">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="groupButtonsSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            🎛️ Groupes à écouter
+        </h2>
+        <div class="section-collapsible-body" id="groupButtonsSectionBody">
+            <h3 class="group-buttons-subtitle">✈️ Fréquences Analogique</h3>
+            <div id="groupButtonsContainer" class="group-buttons-grid"></div>
+            <h3 class="group-buttons-subtitle" id="tetrapolGroupButtonsTitle" style="display: none;">📻 Groupes Tetrapol</h3>
+            <div id="tetrapolGroupButtons" class="group-buttons-grid"></div>
+        </div>
+    </div>
+
+    <!-- Commandes stream toujours présentes une fois l'audio activé ; seules les cards vont et viennent -->
+    <div class="section" id="streamsSection" style="display: none;">
+        <h2 class="streams-header">
+            <span class="streams-header-title">
+                <span class="status-indicator" id="streamsStatusIndicator"></span>
+                🎵 Streams actifs (Analogique + Tetrapol)
+            </span>
+            <div class="streams-header-controls">
+                <div class="volume-control-global">
+                    <span>🔊 Volume:</span>
+                    <input type="range" id="globalVolumeSlider" min="0" max="100" value="50" aria-label="Volume global">
+                    <span id="globalVolumeValue">50%</span>
+                </div>
+                <div class="exclusive-mode-control">
+                    <label for="exclusivePlaybackToggle">🎯 Écoute en queue partagée:</label>
+                    <input type="checkbox" id="exclusivePlaybackToggle" aria-label="Écoute exclusive en file">
+                </div>
+                <div class="exclusive-mode-control" id="exclusiveForceBufferControl" style="display: none;">
+                    <label for="exclusiveForceBufferToggle">⚡ Bascule avant fin tampon</label>
+                    <input type="checkbox" id="exclusiveForceBufferToggle"
+                           aria-label="Forcer l'activation avant saturation du tampon">
+                </div>
+            </div>
+        </h2>
+        <div class="streams-grid" id="streamsContainer">
+            <div class="no-data">Aucun stream actif</div>
+        </div>
+    </div>
+
+    <!-- Admin Pulse / paramètres : visibles uniquement avec #admin -->
+    <div id="adminPanelRoot"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/icecast-metadata-player@1.17.13/build/icecast-metadata-player-1.17.13.main.min.js"></script>
+    <script type="module" src="queue-ring-buffer.js"></script>
+    <script src="logger.js"></script>
+    <script src="admin-include.js"></script>
+    <script src="monitor.js" defer></script>
+</body>
+
+</html>

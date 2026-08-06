@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="description" content="Administration Analogique — tableaux et PulseAudio">
+    <meta name="theme-color" content="#44aaff">
+    <title>Analogique Admin</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+</head>
+
+<body data-admin-page="true">
+    <header class="admin-page-header">
+        <h1>🛠️ Analogique Admin</h1>
+        <nav class="admin-page-nav">
+            <a href="/monitor">🎧 Monitor</a>
+            <a href="/monitor#admin">Monitor + admin</a>
+        </nav>
+    </header>
+
+    <!-- Tableaux uniquement (pas de streaming Icecast) -->
+    <div class="section section-collapsible" id="receptionSection">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="receptionSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            📡 Réception (cellules & devices)
+        </h2>
+        <div class="section-collapsible-body" id="receptionSectionBody">
+            <div id="receptionContainer" class="cells-grid">
+                <div class="no-data">Aucune réception détectée</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section section-collapsible" id="channelsSection">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="channelsSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            <span class="status-indicator" id="channelsStatusIndicator"></span>
+            📡 Transmissions Analogique
+        </h2>
+        <div class="section-collapsible-body" id="channelsSectionBody">
+            <div class="table-container">
+                <table id="channelsTable">
+                    <thead>
+                        <tr>
+                            <th>Device</th>
+                            <th>Canal</th>
+                            <th>Fréquence</th>
+                            <th>Mode</th>
+                            <th>Label</th>
+                            <th>État</th>
+                        </tr>
+                    </thead>
+                    <tbody id="channelsTableBody">
+                        <tr><td colspan="6" class="no-data">Chargement...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="section section-collapsible" id="tetrapolSection" style="display: none;">
+        <h2 class="section-toggle" tabindex="0" aria-expanded="true" aria-controls="tetrapolSectionBody">
+            <span class="section-toggle-icon" aria-hidden="true">▼</span>
+            <span class="status-indicator" id="tetrapolStatusIndicator"></span>
+            📻 Transmissions Tetrapol
+        </h2>
+        <div class="section-collapsible-body" id="tetrapolSectionBody">
+            <div class="table-container">
+                <table id="tetrapolChannelsTable">
+                    <thead>
+                        <tr>
+                            <th>Cellule</th>
+                            <th>Channel</th>
+                            <th>Group</th>
+                            <th>Label</th>
+                            <th>RFSI</th>
+                            <th>RFSI Label</th>
+                            <th>État</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tetrapolChannelsBody">
+                        <tr><td colspan="7" class="no-data">Non connecté</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Pulse + administration (toujours visibles sur index) -->
+    <div id="adminPanelRoot" data-admin-always="true"></div>
+
+    <script src="logger.js"></script>
+    <script src="admin-include.js"></script>
+    <script src="monitor.js" defer></script>
+</body>
+
+</html>

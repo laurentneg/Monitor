@@ -1,0 +1,69 @@
+# Example Apache reverse proxy in front of the monitor (:8082)
+#
+# Dual access (same deployment):
+#   LAN direct:  http://<ip-monitor>:8082  + streams → http://<ip-icecast>:8000/...
+#                (UI uses ICECAST_PUBLIC_BASE when port is not 80/443)
+#   Public/LAN via Apache: https://domaine.externe.com/...
+#                UI/API/WS → monitor:8082
+#                /stream     → Icecast:8000  (bypass Node — important)
+#
+# Requires: a2enmod proxy proxy_http proxy_wstunnel headers ssl
+#
+# Key points for requests that stay "pending":
+# - API: short timeout, no response buffering
+# - /stream: flushpackets=on, long timeout, target Icecast directly
+# - /ws/monitor: WebSocket upgrade via proxy_wstunnel
+
+<VirtualHost *:443>
+    ServerName domaine.externe.com
+
+    SSLEngine on
+    # SSLCertificateFile ...
+    # SSLCertificateKeyFile ...
+
+    ProxyPreserveHost On
+    ProxyTimeout 60
+    SetEnv proxy-nokeepalive 1
+    SetEnv force-proxy-request-1.0 1
+
+    # --- Paths → Node monitor (UI + APIs + Pulse arbiter) ---
+    ProxyPass        /api/monitor  http://127.0.0.1:8082/api/monitor connectiontimeout=5 timeout=30
+    ProxyPassReverse /api/monitor  http://127.0.0.1:8082/api/monitor
+    ProxyPass        /api/airband  http://127.0.0.1:8082/api/airband connectiontimeout=5 timeout=30
+    ProxyPassReverse /api/airband  http://127.0.0.1:8082/api/airband
+    ProxyPass        /api/tetrapol http://127.0.0.1:8082/api/tetrapol connectiontimeout=5 timeout=30
+    ProxyPassReverse /api/tetrapol http://127.0.0.1:8082/api/tetrapol
+    ProxyPass        /api/pulse    http://127.0.0.1:8082/api/pulse connectiontimeout=5 timeout=30
+    ProxyPassReverse /api/pulse    http://127.0.0.1:8082/api/pulse
+
+    # --- Audio: browser → Apache → Icecast (NOT via Node) ---
+    # Adjust Icecast host if it is not on the same machine.
+    ProxyPass        /stream http://127.0.0.1:8000/stream connectiontimeout=5 timeout=86400 flushpackets=on
+    ProxyPassReverse /stream http://127.0.0.1:8000/stream
+
+    # WebSocket bridge
+    ProxyPass        /ws/monitor  ws://127.0.0.1:8082/ws/monitor
+    ProxyPassReverse /ws/monitor  ws://127.0.0.1:8082/ws/monitor
+
+    # UI + everything else
+    ProxyPass        /  http://127.0.0.1:8082/
+    ProxyPassReverse /  http://127.0.0.1:8082/
+
+    <LocationMatch "^/(api|stream)/">
+        Header always set Cache-Control "no-store"
+        Header always set X-Accel-Buffering "no"
+    </LocationMatch>
+</VirtualHost>
+
+# Optional: same path layout on LAN over HTTP (port 80) so phones use
+# http://<ip-apache>/… with /stream → Icecast (no load on Node).
+# <VirtualHost *:80>
+#     ServerName 192.168.0.12
+#     ProxyPreserveHost On
+#     ProxyPass /stream http://127.0.0.1:8000/stream connectiontimeout=5 timeout=86400 flushpackets=on
+#     ProxyPassReverse /stream http://127.0.0.1:8000/stream
+#     ProxyPass /ws/monitor ws://127.0.0.1:8082/ws/monitor
+#     ProxyPassReverse /ws/monitor ws://127.0.0.1:8082/ws/monitor
+#     ProxyPass / http://127.0.0.1:8082/
+#     ProxyPassReverse / http://127.0.0.1:8082/
+# </VirtualHost>
