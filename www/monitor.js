@@ -1068,7 +1068,15 @@
         lastTpSig = '';
         updateAirbandButtons();
         updateTetrapolListing();
-        if (exclusivePlaybackMode) refreshExclusiveCards();
+        if (exclusivePlaybackMode) {
+            refreshExclusiveCards();
+            // Marking prio on a waiting card must cut in immediately when allowed.
+            if (priorityKeys.has(key)) {
+                const waiting = exclusiveQueue.find((s) => s.key === key);
+                if (waiting) preemptActiveWithPriority(waiting);
+                else checkPriorityPreempt();
+            }
+        }
     }
 
     async function togglePulsePriority(key) {
@@ -1373,8 +1381,8 @@
                 btn.appendChild(span);
                 bindLongPressPriority(
                     btn,
-                    () => toggleStreamPriority(entry.key),
-                    () => toggleMonitoring(entry.key)
+                    () => toggleStreamPriority(btn.dataset.key),
+                    () => toggleMonitoring(btn.dataset.key)
                 );
             }
             container.appendChild(btn);
@@ -2465,6 +2473,11 @@
         }
         if (exclusiveActive === seg) return;
         const active = exclusiveActive;
+        // Never kick a live ★ for buffer saturation unless it can yield (blank + <80 %).
+        if (isStreamPrioritySeg(active)) {
+            const unread = getActiveRingUnreadRatio();
+            if (unread >= RING_YIELD_MAX_RATIO || !isPlaybackInBlank(active)) return;
+        }
         if (!active.bufferPlayer?.hasStarted) return;
         const unreadRatio = active.ringBuffer?.maxBytes
             ? Math.min(1, active.ringBuffer.unreadBytes / active.ringBuffer.maxBytes)
@@ -2481,6 +2494,8 @@
         seg.bufferForcePromoted = true;
         startExclusivePlay(seg);
         refreshExclusiveCards();
+        // If we displaced a ★, resume it as soon as this catch-up can yield.
+        checkPriorityPreempt();
     }
 
     function maybeResumeActiveRingPlayback(seg) {
@@ -2668,7 +2683,14 @@
             analyzerConfirmedEnded: false
         };
         seg.card = createExclusiveCard(seg);
-        exclusiveQueue.push(seg);
+        // ★ waiters ahead of normal (same rule as Pulse / Tetrapol enqueue).
+        if (isStreamPrioritySeg(seg)) {
+            const idx = exclusiveQueue.findIndex((s) => !isStreamPrioritySeg(s));
+            if (idx === -1) exclusiveQueue.push(seg);
+            else exclusiveQueue.splice(idx, 0, seg);
+        } else {
+            exclusiveQueue.push(seg);
+        }
         lastStreamTitles[entry.key] = '';
         if (usesQueueRingBuffer()) {
             startQueueRingIngestion(seg);
@@ -2827,7 +2849,9 @@
 
     function isStreamPrioritySeg(seg) {
         if (!seg) return false;
-        return !!(seg.entry?.priority || isStreamPriority(seg.key));
+        // priorityKeys is authoritative; entry.priority can lag after catalog rebuilds.
+        return isStreamPriority(seg.key)
+            || !!(seg.entry && seg.entry.priority);
     }
 
     function getActiveRingUnreadRatio() {
@@ -2840,16 +2864,23 @@
     /**
      * Un stream prio peut prendre la main sauf si :
      * - l'actif est déjà un groupe prio, ou
-     * - « Bascule avant fin tampon » est coché et l'actif a été promu près
-     *   saturation et son tampon non lu est encore ≥ 80 %.
+     * - « Bascule avant fin tampon » et l'actif force-promu a encore ≥ 80 % non lus
+     *   ET n'est pas en blanc (fin de com) — un blanc autorise la prio même ≥ 80 %.
      */
     function canPreemptActiveForPriority() {
         const active = exclusiveActive;
         if (!active) return true;
         if (isStreamPrioritySeg(active)) return false;
+        // Sticky force-promote flag must clear once caught up, or prio stays blocked forever
+        // while a live active keeps refill ≥ 80 %.
+        const unread = getActiveRingUnreadRatio();
+        if (active.bufferForcePromoted && unread < RING_YIELD_MAX_RATIO) {
+            active.bufferForcePromoted = false;
+        }
         if (forceBeforeFull
             && active.bufferForcePromoted
-            && getActiveRingUnreadRatio() >= RING_YIELD_MAX_RATIO) {
+            && unread >= RING_YIELD_MAX_RATIO
+            && !isPlaybackInBlank(active)) {
             return false;
         }
         return true;
@@ -2858,6 +2889,8 @@
     /** Passe un segment prio en actif (préemption) si les règles le permettent. */
     function preemptActiveWithPriority(seg) {
         if (!exclusivePlaybackMode || !seg || seg.suspendedByUser) return false;
+        // Refresh flag from authoritative set before deciding.
+        if (seg.entry) seg.entry.priority = isStreamPriority(seg.key);
         if (!isStreamPrioritySeg(seg)) return false;
         if (exclusiveActive === seg) return false;
         if (!canPreemptActiveForPriority()) return false;
@@ -2881,15 +2914,20 @@
         if (!exclusivePlaybackMode || !exclusiveActive) return;
         if (isStreamPrioritySeg(exclusiveActive)) return;
         const waiting = exclusiveQueue.find(
-            (s) => isStreamPrioritySeg(s) && !s.suspendedByUser
+            (s) => {
+                if (s.entry) s.entry.priority = isStreamPriority(s.key);
+                return isStreamPrioritySeg(s) && !s.suspendedByUser;
+            }
         );
         if (!waiting) return;
         preemptActiveWithPriority(waiting);
     }
 
     function promoteNext() {
-        const prioIdx = exclusiveQueue.findIndex(s =>
-            isStreamPrioritySeg(s) && !s.suspendedByUser);
+        const prioIdx = exclusiveQueue.findIndex((s) => {
+            if (s.entry) s.entry.priority = isStreamPriority(s.key);
+            return isStreamPrioritySeg(s) && !s.suspendedByUser;
+        });
         if (prioIdx >= 0) {
             const [seg] = exclusiveQueue.splice(prioIdx, 1);
             exclusiveActive = seg;
