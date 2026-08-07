@@ -10,10 +10,10 @@ const DEFAULT_CONFIG = {
     tetrapolBase: 'http://127.0.0.1:8080',
     icecastPublicBase: '',
     broadcastIntervalMs: 250,
-    /** Full snapshot resync to clients (patches in between). */
-    fullSyncIntervalMs: 30000,
+    /** Full snapshot resync to clients (patches in between). Keep below UI CELL_INFO_TIMEOUT_MS. */
+    fullSyncIntervalMs: 15000,
     /** Mark Airband/Tetrapol dead if no WS update arrives within this window. */
-    sourceStaleMs: 5000,
+    sourceStaleMs: 30000,
     pulseArbiter: true,
 };
 
@@ -658,10 +658,14 @@ class WsBridge {
     }
 
     broadcastEvent(event) {
-        const key = eventDedupKey(event);
         const raw = JSON.stringify(event);
-        if (this._lastEventByKey.get(key) === raw) return;
-        this._lastEventByKey.set(key, raw);
+        // cell_info is a liveness heartbeat: always forward (identical payloads still refresh UI).
+        const evName = event && event.event != null ? String(event.event) : '';
+        if (evName !== 'cell_info') {
+            const key = eventDedupKey(event);
+            if (this._lastEventByKey.get(key) === raw) return;
+            this._lastEventByKey.set(key, raw);
+        }
         this.broadcastRaw(raw);
     }
 

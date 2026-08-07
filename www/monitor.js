@@ -93,7 +93,8 @@
     let tetrapolGroups = new Map(); // group_id -> group info
     let tetrapolChannels = [];
     let tetrapolCells = new Map(); // channel_id -> cell sync state (from cell_info / cch_sync)
-    const CELL_INFO_TIMEOUT_MS = 25000;
+    /** Cellules KO si aucun cell_info / snapshot frais (doit rester > fullSyncIntervalMs du bridge). */
+    const CELL_INFO_TIMEOUT_MS = 90000;
     let lastTetrapolCellFeedMs = 0;
     /** @type {Map<string, object>} unified playable entries by key */
     let catalog = new Map();
@@ -870,8 +871,11 @@
             const syncErrs = Number(raw.sync_errs) || 0;
             let syncStatus = normalizeCellSyncStatus(raw.sync_status, syncErrs);
             const rawLast = Number(raw.last_cell_info_ms) || 0;
-            // Never refresh freshness from "now" on snapshot — that defeats the 25s timeout.
-            let lastCellInfoTime = rawLast || (prev && prev.lastCellInfoTime) || 0;
+            // Prefer server timestamp; if synced without stamp, treat this live snapshot as a heartbeat.
+            let lastCellInfoTime = rawLast
+                || (syncStatus === 'synced' ? now : 0)
+                || (prev && prev.lastCellInfoTime)
+                || 0;
             if (prev && prev.syncStatus === 'unsynced' && syncStatus === 'synced') {
                 const age = lastCellInfoTime ? (now - lastCellInfoTime) : CELL_INFO_TIMEOUT_MS + 1;
                 if (age > CELL_INFO_TIMEOUT_MS) syncStatus = 'unsynced';
@@ -4292,42 +4296,41 @@
         if (tpTitle && (tp.connected || tetrapolWsUrl)) tpTitle.style.display = '';
         tetrapolBridged = !!tp.connected;
         if (!tp.connected) {
-            // Keep last-known cells visible but force KO (like tetrapol-kit timeout).
+            // Keep last-known channels/cells visible; mark cells KO (like tetrapol-kit timeout).
             tetrapolCells.forEach((c) => {
                 if (c.syncStatus !== 'lost') c.syncStatus = 'unsynced';
             });
-            tetrapolChannels = [];
+            markAllCellsUnsynced('disconnect');
         } else {
             const chObj = tp.channels || {};
             tetrapolChannels = chObj.channels || (Array.isArray(chObj) ? chObj : []);
+            const grObj = tp.groups || {};
+            const groups = grObj.groups || (Array.isArray(grObj) ? grObj : []);
+            tetrapolGroups = new Map(groups.map(g => [String(g.group_id), Object.assign({}, g, {
+                listen: g.listen !== false,
+                encrypted: !!g.encrypted
+            })]));
+            tetrapolChannels.forEach(c => {
+                if (c.group_id == null) return;
+                const gid = String(c.group_id);
+                if (!tetrapolGroups.has(gid)) {
+                    tetrapolGroups.set(gid, {
+                        group_id: gid,
+                        group_label: c.group_label || gid,
+                        on_air: !!c.on_air,
+                        encrypted: !!c.encrypted,
+                        listen: true
+                    });
+                } else if (c.encrypted) {
+                    tetrapolGroups.get(gid).encrypted = true;
+                }
+            });
+            scanTetrapolClearGroups();
+            const cellsRaw = tp.cells;
+            const cellsList = Array.isArray(cellsRaw) ? cellsRaw
+                : (cellsRaw && Array.isArray(cellsRaw.cells) ? cellsRaw.cells : []);
+            if (cellsList.length) applyTetrapolCellsSnapshot(cellsList);
         }
-        const grObj = tp.groups || {};
-        const groups = (!tp.connected) ? [] : (grObj.groups || (Array.isArray(grObj) ? grObj : []));
-        tetrapolGroups = new Map(groups.map(g => [String(g.group_id), Object.assign({}, g, {
-            listen: g.listen !== false,
-            encrypted: !!g.encrypted
-        })]));
-        tetrapolChannels.forEach(c => {
-            if (c.group_id == null) return;
-            const gid = String(c.group_id);
-            if (!tetrapolGroups.has(gid)) {
-                tetrapolGroups.set(gid, {
-                    group_id: gid,
-                    group_label: c.group_label || gid,
-                    on_air: !!c.on_air,
-                    encrypted: !!c.encrypted,
-                    listen: true
-                });
-            } else if (c.encrypted) {
-                tetrapolGroups.get(gid).encrypted = true;
-            }
-        });
-        scanTetrapolClearGroups();
-        const cellsRaw = tp.cells;
-        const cellsList = Array.isArray(cellsRaw) ? cellsRaw
-            : (cellsRaw && Array.isArray(cellsRaw.cells) ? cellsRaw.cells : []);
-        if (cellsList.length) applyTetrapolCellsSnapshot(cellsList);
-        if (!tp.connected) markAllCellsUnsynced('disconnect');
         if (tp.pulse_exclusive) {
             tpPulseExclusiveState = tp.pulse_exclusive;
             applyTetrapolPulsePriorities(tp.pulse_exclusive);
@@ -4563,10 +4566,10 @@
             const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
             if (tpTitle && (tetrapolBridged || tetrapolWsUrl)) tpTitle.style.display = '';
             if (!tetrapolBridged) {
+                // Keep last-known channel list; only force cells KO.
                 tetrapolCells.forEach((c) => {
                     if (c.syncStatus !== 'lost') c.syncStatus = 'unsynced';
                 });
-                tetrapolChannels = [];
                 markAllCellsUnsynced('disconnect');
                 changed = true;
             }

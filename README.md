@@ -123,4 +123,4 @@ Browser connects to `ws://localhost:8082/ws/monitor`. The bridge merges Airband 
 
 - sends a full `type: "update"` snapshot on connect and about every 15 s (`fullSyncIntervalMs`);
 - otherwise sends `type: "patch"` with only changed entities (channel/group upserts & removes, pulse, sources…);
-- relays Tetrapol `event` frames (`cell_info`, `cch_sync`), deduplicated when identical payloads repeat.
+- relays Tetrapol `event` frames (`cell_info` always forwarded as liveness; `cch_sync` deduplicated when identical).
