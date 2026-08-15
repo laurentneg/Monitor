@@ -236,6 +236,29 @@ h1 {
     min-width: 35px;
 }
 
+.playback-rate-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    margin-left: 0.25em;
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.9em;
+    font-weight: normal;
+    color: #aaa;
+}
+
+.playback-rate-control input[type=checkbox] {
+    width: 1em;
+    height: 1em;
+    accent-color: #4af;
+    cursor: pointer;
+}
+
+.playback-rate-control:has(input:checked) {
+    color: #6cf;
+}
+
 .exclusive-mode-control {
     display: flex;
     align-items: center;

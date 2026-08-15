@@ -21,9 +21,10 @@
     }
     const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/monitor';
     const OFF_AIR_GRACE_MS = 5000; // drop empty exclusive queue items after off-air grace
-    // Fin de com : ~2 s de blanc gardés dans le ring (queue-ring-buffer blankMarginSec),
-    // puis 7 s d'attente avant fermeture. Si à la lecture effectiveBlankSec ≥ 7 → stop immédiat.
+    // Fin de com : blanc gardé dans le ring (blankMarginSec), puis hold avant fermeture.
+    // Airband : +1 s de blanc (ringConfigForEntry) pour allonger sans couper le stream.
     const STREAM_END_HOLD_MS = 7000;
+    const AIRBAND_BLANK_EXTRA_SEC = 1.0;
     /** Ignorer les parasites : ne pas ouvrir une carte avant 100 ms de com continue. */
     const MIN_ON_AIR_START_MS = 100;
     const SYNC_DEBOUNCE_MS = 150;
@@ -122,6 +123,9 @@
     let departmentsMap = {};
     let countriesMap = {};
     let globalVolume = parseInt(localStorage.getItem('globalVolume') || '50', 10);
+    let playbackRateFast = localStorage.getItem('playbackRateFast') === 'true';
+    const PLAYBACK_RATE_FAST = 1.5;
+    const PLAYBACK_RATE_NORMAL = 1;
 
     let lastAirSig = '';
     let lastAirBtnSig = '';
@@ -148,6 +152,7 @@
         exclusiveForceControl: document.getElementById('exclusiveForceBufferControl'),
         volumeSlider: document.getElementById('globalVolumeSlider'),
         volumeValue: document.getElementById('globalVolumeValue'),
+        playbackRateFastToggle: document.getElementById('playbackRateFastToggle'),
         tetrapolSection: document.getElementById('tetrapolSection'),
         tetrapolBody: document.getElementById('tetrapolChannelsBody'),
         tetrapolStatus: document.getElementById('tetrapolStatusIndicator'),
@@ -609,7 +614,7 @@
         return 'file';
     }
 
-    function cardHeaderHtml(entry, txTitle) {
+    function cardHeaderHtml(entry, txTitle, frozenGroupLabel) {
         const src = sourceLabel(entry);
         if (entry && entry.source === 'airband') {
             const title = labelOf(entry);
@@ -620,7 +625,7 @@
                 ${freq ? `<div class="stream-card-subtitle">${freq}</div>` : ''}
             </div>`;
         }
-        const group = labelOf(entry);
+        const group = tetrapolCardGroupLabel(entry, frozenGroupLabel);
         const streamTitle = (txTitle || '').trim();
         return `<div class="stream-card-header stream-card-zone stream-card-zone-name stream-card-header-tetrapol">
             <div class="stream-card-source">${src}</div>
@@ -635,7 +640,7 @@
         let header = card.querySelector('.stream-card-header');
         if (!header) {
             const wrap = document.createElement('div');
-            wrap.innerHTML = cardHeaderHtml(entry, opts.txTitle || '');
+            wrap.innerHTML = cardHeaderHtml(entry, opts.txTitle || '', opts.groupLabel || '');
             header = wrap.firstElementChild;
             const oldName = card.querySelector('.stream-name, .stream-card-zone-name');
             if (oldName) oldName.replaceWith(header);
@@ -662,7 +667,7 @@
             } else if (subEl) subEl.remove();
         } else {
             header.classList.add('stream-card-header-tetrapol');
-            const group = labelOf(entry);
+            const group = tetrapolCardGroupLabel(entry, opts.groupLabel);
             const streamTitle = (opts.txTitle || '').trim();
             if (titleEl) titleEl.textContent = streamTitle || '\u00a0';
             if (subEl) {
@@ -1124,6 +1129,87 @@
     function getDepartmentName(bnId) {
         if (bnId == null || bnId < 0) return 'Département inconnu';
         return departmentsMap[String(bnId)] || 'Département inconnu';
+    }
+
+    /** Canal Tetrapol le plus pertinent pour un groupe (on_air récent, sinon dernier actif). */
+    function findBestChannelForGroup(groupId) {
+        const groupIdStr = String(groupId);
+        const groupChannels = tetrapolChannels.filter((ch) => String(ch.group_id) === groupIdStr);
+        if (!groupChannels.length) return null;
+        const byRecency = (a, b) => (b.last_active_ms || 0) - (a.last_active_ms || 0);
+        const onAirChannels = groupChannels.filter((ch) => ch.on_air).sort(byRecency);
+        return onAirChannels[0] || [...groupChannels].sort(byRecency)[0];
+    }
+
+    /** Département de la cellule d'activation (comme tetrapol-kit). */
+    function getGroupCommunicationDetails(groupId) {
+        const channel = findBestChannelForGroup(groupId);
+        if (!channel) return null;
+
+        let departmentName = null;
+        let departmentCode = null;
+
+        const cellByChannelId = (channel.channel_id !== undefined && channel.channel_id !== null)
+            ? (tetrapolCells.get(Number(channel.channel_id))
+                || [...tetrapolCells.values()].find((c) => c.channelId == channel.channel_id)
+                || null)
+            : null;
+
+        const cellByCellId = (channel.cell_id !== undefined && channel.cell_id !== null && channel.cell_id !== '-')
+            ? ([...tetrapolCells.values()].find((c) => String(c.cellId) === String(channel.cell_id)) || null)
+            : null;
+
+        const cell = cellByChannelId || cellByCellId || null;
+        if (cell && cell.bnId !== undefined && cell.bnId !== null) {
+            departmentCode = String(cell.bnId);
+            departmentName = getDepartmentName(cell.bnId);
+        }
+
+        return {
+            isOnAir: !!channel.on_air,
+            rfsi: channel.on_air ? (channel.rfsi || null) : null,
+            rfsiLabel: channel.on_air ? (channel.rfsi_label || null) : null,
+            departmentName,
+            departmentCode
+        };
+    }
+
+    /** Label groupe + « - {code} {département} » (même format que tetrapol-kit). */
+    function getGroupDisplayNameWithDepartment(groupId) {
+        const gid = String(groupId || '');
+        const entry = catalog.get(tpKey(gid));
+        const baseLabel = (entry ? labelOf(entry) : '')
+            || String(tetrapolGroups.get(gid)?.group_label || '').trim()
+            || gid
+            || 'Groupe';
+        const details = getGroupCommunicationDetails(gid);
+        if (details && details.departmentName && details.departmentCode) {
+            return `${baseLabel} - ${details.departmentCode} ${details.departmentName}`;
+        }
+        if (details && details.departmentName) {
+            return `${baseLabel} - ${details.departmentName}`;
+        }
+        return baseLabel;
+    }
+
+    /** Nom de carte Tetrapol : figé sur le segment si présent, sinon calcul live. */
+    function tetrapolCardGroupLabel(entry, frozenDisplayName) {
+        const frozen = String(frozenDisplayName || '').trim();
+        if (frozen) return frozen;
+        const gid = entry && entry.rawId != null ? String(entry.rawId) : '';
+        if (!gid) return labelOf(entry);
+        return getGroupDisplayNameWithDepartment(gid);
+    }
+
+    /** Figé à la création du segment (évite le bascule entre départements en lecture). */
+    function segmentDisplayName(seg) {
+        if (!seg) return '';
+        const entry = catalogEntryFor(seg) || seg.entry;
+        if (!entry || entry.source !== 'tetrapol') return labelOf(entry);
+        if (!seg.displayName) {
+            seg.displayName = getGroupDisplayNameWithDepartment(entry.rawId);
+        }
+        return seg.displayName;
     }
 
     async function loadDepartments() {
@@ -1915,6 +2001,34 @@
         setDot(el.streamsStatus, count > 0);
     }
 
+    function desiredPlaybackRate() {
+        return playbackRateFast ? PLAYBACK_RATE_FAST : PLAYBACK_RATE_NORMAL;
+    }
+
+    function applyAudioOutput(audio) {
+        if (!audio) return;
+        audio.volume = globalVolume / 100;
+        try { audio.playbackRate = desiredPlaybackRate(); } catch (_) {}
+    }
+
+    function applyPlaybackRateToAll() {
+        const rate = desiredPlaybackRate();
+        players.forEach((p) => {
+            const a = getAudio(p);
+            if (a) try { a.playbackRate = rate; } catch (_) {}
+        });
+        const allEx = [...exclusiveQueue];
+        if (exclusiveActive) allEx.push(exclusiveActive);
+        allEx.forEach((seg) => {
+            if (seg.queueAudioEl) {
+                try { seg.queueAudioEl.playbackRate = rate; } catch (_) {}
+            }
+            if (seg.playbackPlayer?.audioElement && seg.playbackPlayer.audioElement !== seg.queueAudioEl) {
+                try { seg.playbackPlayer.audioElement.playbackRate = rate; } catch (_) {}
+            }
+        });
+    }
+
     function getAudio(entry) {
         if (!entry) return null;
         return entry.player?.audioElement || entry.audio || null;
@@ -2031,7 +2145,7 @@
     function liveEdgeIsBlank(seg) {
         const rb = seg?.ringBuffer;
         if (!rb) return true;
-        // Pendant la marge de 2 s, l'audio appartient encore à la com.
+        // Pendant la marge blankMarginSec, l'audio appartient encore à la com.
         if (rb.blankGraceActive) return false;
         if (rb.inBlank) return true;
         return !String(rb.lastTitle || '').trim();
@@ -2320,7 +2434,8 @@
                 if (exclusiveActive?.key === key) card.classList.add('playing');
                 updateCardHeader(card, entry, {
                     txTitle: t,
-                    role: queueRoleLabel(seg, exclusiveActive === seg)
+                    role: queueRoleLabel(seg, exclusiveActive === seg),
+                    groupLabel: segmentDisplayName(seg)
                 });
                 const st = card.querySelector('.card-status');
                 if (st && exclusiveActive?.key === key) st.textContent = 'En cours';
@@ -2329,7 +2444,8 @@
             if (card && entry) {
                 updateCardHeader(card, entry, {
                     txTitle: '',
-                    role: queueRoleLabel(seg, exclusiveActive === seg)
+                    role: queueRoleLabel(seg, exclusiveActive === seg),
+                    groupLabel: segmentDisplayName(seg)
                 });
             }
             armBlankCountdown(key);
@@ -2395,12 +2511,12 @@
         let player = createStreamPlayer(entry.streamUrl, entry.key);
         if (player) {
             audioEl = player.audioElement;
-            audioEl.volume = globalVolume / 100;
+            applyAudioOutput(audioEl);
             player.play();
         } else {
             audioEl = new Audio(entry.streamUrl);
             audioEl.crossOrigin = 'anonymous';
-            audioEl.volume = globalVolume / 100;
+            applyAudioOutput(audioEl);
             audioEl.play().catch(() => {});
         }
 
@@ -2502,6 +2618,24 @@
 
     function getRingBufferKit() {
         return window.QueueRingBufferKit || null;
+    }
+
+    /**
+     * Config ring : pour Airband, garder +1 s de blanc dans le tampon après fin de
+     * StreamTitle / on_air, sans couper l'ingestion Icecast (pas de drop trop tôt).
+     */
+    function ringConfigForSegment(seg) {
+        const kit = getRingBufferKit();
+        const base = kit?.QUEUE_BUFFER_CONFIG || {};
+        if (seg?.ringConfig) return seg.ringConfig;
+        const entry = catalogEntryFor(seg) || seg?.entry;
+        if (entry?.source === 'airband') {
+            const margin = (base.blankMarginSec ?? 2) + AIRBAND_BLANK_EXTRA_SEC;
+            seg.ringConfig = { ...base, blankMarginSec: margin };
+            return seg.ringConfig;
+        }
+        seg.ringConfig = base;
+        return base;
     }
 
     /** Firefox (et Safari) : pas de SourceBuffer audio/mpeg → pas de file MSE. */
@@ -2631,7 +2765,8 @@
         }
         updateCardHeader(seg.card, entry, {
             txTitle: display,
-            role: queueRoleLabel(seg, exclusiveActive === seg)
+            role: queueRoleLabel(seg, exclusiveActive === seg),
+            groupLabel: segmentDisplayName(seg)
         });
         const status = seg.card.querySelector('.card-status');
         if (!status) return;
@@ -2664,7 +2799,7 @@
     function initExclusiveRingBuffer(seg) {
         const kit = getRingBufferKit();
         if (!kit || seg.ringBuffer) return;
-        const cfg = kit.QUEUE_BUFFER_CONFIG;
+        const cfg = ringConfigForSegment(seg);
         seg.ringBuffer = new kit.AudioRingBuffer(cfg.bufferDurationSec, cfg.fallbackBitrate, cfg);
         // Analogique : ne pas remplir le tampon tant qu'il n'y a pas de StreamTitle (blanc initial).
         if (seg.entry?.source === 'airband' && typeof seg.ringBuffer.beginAwaitingStreamTitle === 'function') {
@@ -2697,8 +2832,8 @@
         const kit = getRingBufferKit();
         if (!seg.ringBuffer || seg.bufferPlayer) return seg.bufferPlayer;
         const audio = ensureSegmentQueueAudio(seg);
-        seg.bufferPlayer = new kit.BufferPlayer(audio, seg.ringBuffer, kit.QUEUE_BUFFER_CONFIG);
-        audio.volume = globalVolume / 100;
+        seg.bufferPlayer = new kit.BufferPlayer(audio, seg.ringBuffer, ringConfigForSegment(seg));
+        applyAudioOutput(audio);
         return seg.bufferPlayer;
     }
 
@@ -2728,7 +2863,7 @@
         seg.ringIngestor = new kit.StreamIngestor(
             seg.ringBuffer,
             seg.url,
-            kit.QUEUE_BUFFER_CONFIG,
+            ringConfigForSegment(seg),
             {
                 onConnected: (meta) => {
                     if (meta.icyBr) seg.ringBuffer.setBitrate(meta.icyBr);
@@ -2881,7 +3016,7 @@
 
         seg.ringPlaybackPending = true;
         seg.playbackPlayer = buildBufferPlayerWrapper(seg);
-        if (seg.queueAudioEl) seg.queueAudioEl.volume = globalVolume / 100;
+        applyAudioOutput(seg.queueAudioEl);
 
         const playGen = (seg._ringPlayGen = (seg._ringPlayGen || 0) + 1);
         const stillActive = () => seg._ringPlayGen === playGen
@@ -3014,7 +3149,7 @@
         // Âge réel du blanc (marge ring + silence sauté + wall clock).
         const effectiveBlankMs = getBlankAgeMs(seg.key, seg);
 
-        // Rattrapage : blanc déjà > 7 s dans le tampon → aucune reprise, fermer.
+        // Rattrapage : blanc déjà > hold dans le tampon → aucune reprise, fermer.
         if (effectiveBlankMs >= STREAM_END_HOLD_MS) {
             stopEntry(seg.key);
         } else if (effectiveBlankMs >= 200 && !blankTimers[seg.key]) {
@@ -3040,7 +3175,11 @@
             ringBlankSinceMs: null,
             playbackBlankSinceMs: null,
             createdAtMs: performance.now(),
-            analyzerConfirmedEnded: false
+            analyzerConfirmedEnded: false,
+            // Nom + département figés à la création (canal d'activation), comme tetrapol-kit.
+            displayName: entry.source === 'tetrapol'
+                ? getGroupDisplayNameWithDepartment(entry.rawId)
+                : ''
         };
         seg.card = createExclusiveCard(seg);
         // ★ waiters ahead of normal (same rule as Pulse / Tetrapol enqueue).
@@ -3082,7 +3221,7 @@
         card.dataset.key = seg.key;
         // File : uniquement « Écouter » (comme tetrapol-kit). Actif : Mute/Pause/Direct/Stop.
         card.innerHTML = `
-            ${cardHeaderHtml(catalogEntryFor(seg), '')}
+            ${cardHeaderHtml(catalogEntryFor(seg), '', segmentDisplayName(seg))}
             <div class="stream-controls stream-card-zone stream-card-zone-controls queue-card-controls">
                 <button type="button" class="queue-promote-btn" title="Écouter maintenant">▶️ Écouter</button>
                 <button type="button" class="mute-btn" style="display:none">🔇 Mute</button>
@@ -3095,7 +3234,10 @@
                 <div><strong>💾 Tampon:</strong> <span class="card-buffer">—</span></div>
                 <div class="ring-progress"><div class="ring-progress-fill"></div></div>
             </div>`;
-        updateCardHeader(card, catalogEntryFor(seg), { role: 'file' });
+        updateCardHeader(card, catalogEntryFor(seg), {
+            role: 'file',
+            groupLabel: segmentDisplayName(seg)
+        });
         card.querySelector('.queue-promote-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             promote(seg.key);
@@ -3320,7 +3462,7 @@
         // <audio> sans Icy-MetaData → Icecast envoie du MP3 nu (OK Firefox).
         const audioEl = new Audio(seg.url);
         audioEl.crossOrigin = 'anonymous';
-        audioEl.volume = globalVolume / 100;
+        applyAudioOutput(audioEl);
         audioEl.play().catch(() => {});
         const player = {
             audioElement: audioEl,
@@ -3417,7 +3559,8 @@
             const title = getSegmentDisplayTitle(seg);
             updateCardHeader(seg.card, entry, {
                 txTitle: title,
-                role: queueRoleLabel(seg, isActive)
+                role: queueRoleLabel(seg, isActive),
+                groupLabel: segmentDisplayName(seg)
             });
             if (status && !blankDeadlines[seg.key]) {
                 if (isActive) {
@@ -4811,15 +4954,24 @@
                 globalVolume = parseInt(el.volumeSlider.value, 10);
                 localStorage.setItem('globalVolume', String(globalVolume));
                 if (el.volumeValue) el.volumeValue.textContent = globalVolume + '%';
-                players.forEach(p => { const a = getAudio(p); if (a) a.volume = globalVolume / 100; });
+                players.forEach(p => { applyAudioOutput(getAudio(p)); });
                 const allEx = [...exclusiveQueue];
                 if (exclusiveActive) allEx.push(exclusiveActive);
                 allEx.forEach((seg) => {
-                    if (seg.queueAudioEl) seg.queueAudioEl.volume = globalVolume / 100;
-                    if (seg.playbackPlayer?.audioElement) {
-                        seg.playbackPlayer.audioElement.volume = globalVolume / 100;
+                    applyAudioOutput(seg.queueAudioEl);
+                    if (seg.playbackPlayer?.audioElement
+                        && seg.playbackPlayer.audioElement !== seg.queueAudioEl) {
+                        applyAudioOutput(seg.playbackPlayer.audioElement);
                     }
                 });
+            });
+        }
+        if (el.playbackRateFastToggle) {
+            el.playbackRateFastToggle.checked = playbackRateFast;
+            el.playbackRateFastToggle.addEventListener('change', () => {
+                playbackRateFast = !!el.playbackRateFastToggle.checked;
+                localStorage.setItem('playbackRateFast', playbackRateFast ? 'true' : 'false');
+                applyPlaybackRateToAll();
             });
         }
     }
