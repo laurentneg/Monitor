@@ -107,6 +107,13 @@ h1 {
     font-weight: bold;
 }
 
+.admin-action-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
 .admin-action-labels {
     background: #f80;
 }
@@ -1557,13 +1564,13 @@ tr:hover {
     animation: pulse-glow-dim 1.5s infinite;
 }
 
-#reloadLabelsBtn:hover {
+#reloadLabelsBtn:hover:not(:disabled) {
     background: #d70;
     transform: translateY(-2px);
     box-shadow: 0 4px 8px rgba(255, 136, 0, 0.3);
 }
 
-#reloadLabelsBtn:active {
+#reloadLabelsBtn:active:not(:disabled) {
     transform: translateY(0);
 }
 

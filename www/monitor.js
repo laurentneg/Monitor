@@ -124,7 +124,7 @@
     let countriesMap = {};
     let globalVolume = parseInt(localStorage.getItem('globalVolume') || '50', 10);
     let playbackRateFast = localStorage.getItem('playbackRateFast') === 'true';
-    const PLAYBACK_RATE_FAST = 1.5;
+    const PLAYBACK_RATE_FAST = 1.25;
     const PLAYBACK_RATE_NORMAL = 1;
 
     let lastAirSig = '';
