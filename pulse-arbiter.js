@@ -179,6 +179,9 @@ class PulseArbiter {
         // Rebuild FIFO from project listen_groups when claim HTTP lagged / missed.
         const added = this.syncWaitersFromTelemetry();
         if (this._busy) return;
+        if (!this.globalActive) {
+            this.adoptLocalActivesIfIdle();
+        }
         if (this.globalActive) {
             this.maybePriorityPreempt();
             this.maybeForcePromote();
@@ -274,6 +277,46 @@ class PulseArbiter {
             dropped.map((s) => this.fmtSlot(s)).join(', '),
             `| queue=${this.queueSummary()}`);
         return dropped.length;
+    }
+
+    /**
+     * Monitor lancé après coup : les projets ont déjà un actif Pulse local.
+     * L'adopter au lieu de le traiter comme un waiter (sinon yield + silence).
+     * S'il y a déjà une ★ en file, on laisse promoteNext la grant.
+     */
+    adoptLocalActivesIfIdle() {
+        if (this.globalActive) return false;
+        if (this.globalQueue.some((s) => s.priority)) return false;
+        const locals = [];
+        for (const source of ['airband', 'tetrapol']) {
+            const pe = this._snap[source] || {};
+            if (pe.exclusive === false) continue;
+            const id = pe.active_group_id ? String(pe.active_group_id) : '';
+            if (!id) continue;
+            const meta = this.groupMeta(pe, id);
+            locals.push({
+                source,
+                id,
+                priority: !!meta.priority,
+                fill_ratio: meta.fill_ratio,
+            });
+        }
+        if (!locals.length) return false;
+        locals.sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
+        const slot = locals[0];
+        this.removeFromQueue(slot);
+        this.globalActive = {
+            source: slot.source,
+            id: slot.id,
+            priority: !!slot.priority,
+            fill_ratio: slot.fill_ratio,
+        };
+        this._activeSinceMs = Date.now();
+        this._drainedTicks = 0;
+        this.log('adopt local active (late monitor)', this.fmtSlot(this.globalActive),
+            `| queue=${this.queueSummary()}`);
+        this.notifyChange();
+        return true;
     }
 
     /**
@@ -501,8 +544,9 @@ class PulseArbiter {
 
     /**
      * Can another channel preempt this active? Always uses fresh telemetry fill.
-     * Backlog ≥ 80 % or on-air → no preemption (★ or saturated waiter).
-     * @param {{ priorityPreempt?: boolean }} opts — true = ★ (400 ms grace), false = force-promote (15 s)
+     * Backlog ≥ 80 % → no preemption (★ or saturated waiter).
+     * ★ : peut couper une com encore on_air (comme Airband local / cartes Icecast).
+     * Force-promote : seulement si l'actif n'est plus on_air.
      */
     canPreemptActive(active, { priorityPreempt = false } = {}) {
         if (!active) return true;
@@ -516,7 +560,7 @@ class PulseArbiter {
         const fill = Number(meta.fill_ratio);
         if (Number.isFinite(fill) && fill >= YIELD_MAX_UNREAD_RATIO) return false;
 
-        if (meta.on_air) return false;
+        if (!priorityPreempt && meta.on_air) return false;
 
         return true;
     }
@@ -707,7 +751,8 @@ class PulseArbiter {
                 };
                 if (cur.priority || !this.canPreemptActive(cur, { priorityPreempt: true })) return;
                 const meta = this.groupMeta(this._snap[target.source] || {}, target.id);
-                if (!meta.priority || !this.hasPlayableAudio(meta)) return;
+                if (!(target.priority || meta.priority)) return;
+                if (!this.hasPlayableAudio(meta)) return;
 
                 await this.preemptActiveWith(
                     { ...target, ...meta, priority: true },

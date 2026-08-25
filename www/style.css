@@ -1,24 +1,26 @@
-#channelsTable tbody>tr:has(td>span.status-indicator.on-air),
-#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air) {
+/* Analogique : on-air toujours vert (pas de chiffrement). */
+#channelsTable tbody>tr:has(td>span.status-indicator.on-air) {
     background-color: #558855;
     font-weight: bold;
 }
 
-#channelsTable tbody>tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear),
-#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear) {
-    background-color: #558855;
+#channelsTable tbody>tr:has(td>span.status-indicator.on-air):hover {
+    background-color: #669966;
 }
 
+/* Tetrapol : on-air gris (chiffré) par défaut, vert seulement en clair. */
 #tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air) {
     background-color: #777;
+    font-weight: bold;
 }
 
+#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air).channel-clear,
 #tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear) {
     background-color: #558855;
 }
 
-#channelsTable tbody>tr:has(td>span.status-indicator.on-air):hover,
-#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air):hover {
+#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air).channel-clear:hover,
+#tetrapolChannelsTable tbody>tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear):hover {
     background-color: #669966;
 }
 
@@ -529,6 +531,11 @@ tr:hover {
     background: linear-gradient(160deg, #1e3a2e 0%, #243a30 55%, #1a2e24 100%);
     box-shadow: 0 0 0 1px rgba(34, 204, 136, 0.45), 0 2px 12px rgba(34, 204, 136, 0.18);
     opacity: 1;
+}
+
+.stream-card.playing.manual-priority {
+    border-color: #e6c35c;
+    box-shadow: 0 0 0 1px rgba(230, 195, 92, 0.55), 0 2px 12px rgba(230, 195, 92, 0.2);
 }
 
 .stream-card.playing .stream-card-source {
@@ -1833,10 +1840,21 @@ tr:hover {
         border: 1px solid #555;
     }
 
-    #channelsTable tbody > tr:has(td>span.status-indicator.on-air),
-    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air) {
+    #channelsTable tbody > tr:has(td>span.status-indicator.on-air) {
         background-color: #558855;
         font-weight: bold;
+        border-color: #6a6;
+    }
+
+    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air) {
+        background-color: #777;
+        font-weight: bold;
+        border-color: #999;
+    }
+
+    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air).channel-clear,
+    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear) {
+        background-color: #558855;
         border-color: #6a6;
     }
 
@@ -1845,8 +1863,12 @@ tr:hover {
         background: #3a3a3a;
     }
 
-    #channelsTable tbody > tr:has(td>span.status-indicator.on-air):hover,
-    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air):hover {
+    #channelsTable tbody > tr:has(td>span.status-indicator.on-air):hover {
+        background-color: #669966;
+    }
+
+    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air).channel-clear:hover,
+    #tetrapolChannelsTable tbody > tr:has(td>span.status-indicator.on-air):has(td span.encryption-icon.clear):hover {
         background-color: #669966;
     }
 

@@ -22,8 +22,8 @@ export const QUEUE_BUFFER_CONFIG = {
     feedLoopIntervalMs: 100,
     targetLeadSec: 10,
     sourceBufferCleanupBehindSec: 30,
-    reconnectBaseDelayMs: 1000,
-    reconnectMaxDelayMs: 30000,
+    reconnectBaseDelayMs: 400,
+    reconnectMaxDelayMs: 4000,
     // Garde-fou: si aucun StreamTitle n'arrive, ne pas bloquer la lecture indéfiniment.
     firstTitleWaitMaxMs: 3500,
     // Seuil d'affichage « au direct » (label carte, bouton Direct).
@@ -61,10 +61,75 @@ export class AudioRingBuffer {
         this.blankGraceActive = false;
         this.blankGraceStartedAtMs = 0;
         this.blankGraceStartByte = 0;
+        /** Tetrapol : false si on_air ↓ — les titres ICY collés ne relancent pas la com. */
+        this._liveSpeech = true;
+        /** Titre ICY arrivé juste avant on_air ↑ (course live-speech-off). */
+        this._heldTitleWhileSpeechOff = null;
+        /** Dernier titre non vide avant un blanc (détection ICY collé pendant la grâce). */
+        this._titleBeforeBlank = '';
     }
 
     setPlaybackPaused(paused) {
         this._playbackPaused = !!paused;
+    }
+
+    /**
+     * Tetrapol : _liveSpeech suit le listing on_air pour ignorer les titres collés.
+     * Ne JAMAIS injecter un StreamTitle vide ici — seul Icecast peut blanchir le ring
+     * (sinon on corrompt titleChanges alors que le mount a encore un talker).
+     */
+    setLiveSpeech(on) {
+        const next = !!on;
+        if (this._liveSpeech === next) return;
+        this._liveSpeech = next;
+        if (next) {
+            this._resumeFromLiveSpeech();
+            const held = this._heldTitleWhileSpeechOff;
+            this._heldTitleWhileSpeechOff = null;
+            if (held && held.title && (performance.now() - held.at) < 1500) {
+                this.addTitleChange({ StreamTitle: held.title });
+            }
+        }
+    }
+
+    get liveSpeech() {
+        return !!this._liveSpeech;
+    }
+
+    /**
+     * on_air ↑ : recommencer à stocker tout de suite, sans attendre un StreamTitle.
+     * Pendant la grâce : annuler (l'audio de marge reste sous l'ancien titre) et
+     * ancrer une reprise à l'offset courant. Pendant inBlank : sortir du drop.
+     */
+    _resumeFromLiveSpeech() {
+        if (this.awaitingFirstTitle) return false;
+        if (this.blankGraceActive) {
+            this._cancelBlankGrace();
+            this.titleChanges.push({
+                byteOffset: this.totalBytesWritten,
+                title: '',
+                liveResume: true,
+                droppedBlankSec: 0,
+                blankWallMs: 0,
+            });
+            this._pruneTitles();
+            return true;
+        }
+        if (!this.inBlank) return false;
+        this._finalizeBlankMarker();
+        this.preRoll = [];
+        this.preRollBytes = 0;
+        this.inBlank = false;
+        this.blankTailRemaining = 0;
+        this.titleChanges.push({
+            byteOffset: this.totalBytesWritten,
+            title: '',
+            liveResume: true,
+            droppedBlankSec: 0,
+            blankWallMs: 0,
+        });
+        this._pruneTitles();
+        return true;
     }
 
     setBitrate(bitrate) {
@@ -103,15 +168,23 @@ export class AudioRingBuffer {
         if (this.awaitingFirstTitle) {
             const waitMs = performance.now() - (this.awaitingFirstTitleSinceMs || 0);
             if (waitMs >= (this.config.firstTitleWaitMaxMs || 3500)) {
-                // Fallback: certains flux n'envoient pas de StreamTitle exploitable au démarrage.
+                // Pas de StreamTitle exploitable : rester en blanc (ne pas stocker
+                // le silence Icecast comme une com — sinon la carte reste « active »).
                 this.awaitingFirstTitle = false;
                 this.awaitingFirstTitleSinceMs = 0;
-                this.inBlank = false;
+                this.lastTitle = '';
+                this.inBlank = true;
                 this.blankTailRemaining = 0;
-            } else {
-                this.droppedBlankBytes += chunk.length;
+                if (!this.blankStartedAtMs) {
+                    this.blankStartedAtMs = performance.now();
+                    this.blankStartByte = this.totalBytesWritten;
+                    this.currentBlankDroppedBytes = 0;
+                }
+                this._handleBlankAudio(chunk);
                 return;
             }
+            this.droppedBlankBytes += chunk.length;
+            return;
         }
         if (this.inBlank) {
             this._handleBlankAudio(chunk);
@@ -228,8 +301,50 @@ export class AudioRingBuffer {
     }
 
     addTitleChange(metadata) {
-        const title = metadata?.StreamTitle ?? metadata?.streamTitle ?? metadata?.title ?? '';
-        const isEmpty = !String(title).trim();
+        const rawTitle = metadata?.StreamTitle ?? metadata?.streamTitle ?? metadata?.title ?? '';
+        let title = String(rawTitle ?? '').trim();
+        let isEmpty = !title;
+        let coerceReason = '';
+
+        // Icecast recolle souvent le dernier talker juste après un blanc / on_air ↓.
+        // Sticky uniquement tant que la parole listing est encore off : un vrai
+        // on_air↑ (+ même RFSI) doit pouvoir sortir de la grâce.
+        if (!isEmpty && !this._liveSpeech && title === this._titleBeforeBlank
+            && (this.blankGraceActive || this.inBlank)) {
+            const holdMs = (this.config.blankHoldSec || 7) * 1000;
+            const t0 = this.blankGraceStartedAtMs || this.blankStartedAtMs || 0;
+            const age = t0 ? (performance.now() - t0) : 0;
+            if (this.blankGraceActive || age < holdMs) {
+                isEmpty = true;
+                title = '';
+                coerceReason = this.blankGraceActive ? 'sticky-during-grace' : 'sticky-while-blank';
+            }
+        }
+        if (!isEmpty && !this._liveSpeech) {
+            // Titre ICY pendant listing off : retenir pour on_air↑, ne pas écrire
+            // de blanc artificiel dans titleChanges (le stream a encore ce label).
+            this._heldTitleWhileSpeechOff = { title, at: performance.now() };
+            if (typeof window !== 'undefined' && window.__MONITOR_DEBUG__) {
+                console.log(
+                    '%c[debug:ring]%c addTitleChange',
+                    'background:#2e7d32;color:#fff;padding:1px 6px;border-radius:3px',
+                    'color:inherit',
+                    {
+                        t: new Date().toISOString().slice(11, 23),
+                        StreamTitle: '(held)',
+                        raw: rawTitle,
+                        coerceReason: 'live-speech-off',
+                        liveSpeech: this._liveSpeech,
+                        awaitingFirstTitle: this.awaitingFirstTitle,
+                        inBlank: this.inBlank,
+                        blankGraceActive: this.blankGraceActive,
+                        lastTitle: this.lastTitle,
+                        bytesWritten: this.totalBytesWritten,
+                    }
+                );
+            }
+            return false;
+        }
 
         if (typeof window !== 'undefined' && window.__MONITOR_DEBUG__) {
             console.log(
@@ -239,7 +354,9 @@ export class AudioRingBuffer {
                 {
                     t: new Date().toISOString().slice(11, 23),
                     StreamTitle: isEmpty ? '(empty)' : String(title),
-                    raw: title,
+                    raw: rawTitle,
+                    coerceReason: coerceReason || null,
+                    liveSpeech: this._liveSpeech,
                     metaKeys: metadata && typeof metadata === 'object' ? Object.keys(metadata) : [],
                     awaitingFirstTitle: this.awaitingFirstTitle,
                     inBlank: this.inBlank,
@@ -261,16 +378,36 @@ export class AudioRingBuffer {
             this.preRoll = [];
             this.preRollBytes = 0;
             this.lastTitle = title;
+            this._titleBeforeBlank = '';
             this._recordTitle(title);
             return true;
         }
 
-        if (title === this.lastTitle) {
+        // lastTitle === null : jamais de titre réel (ex. après timeout 1er titre).
+        // Ne pas traiter '' comme doublon de null — il faut entrer / rester en blanc.
+        const prevTitle = this.lastTitle == null ? null : String(this.lastTitle).trim();
+        if (prevTitle !== null && title === prevTitle) {
             // Métadonnée blanc répétée (silence prolongé) : ré-ancrer le marqueur
             // après rotation du tampon pour ne pas laisser un vieux label couvrir le blanc.
             if (isEmpty && this.blankGraceActive) {
                 this._maybeConfirmBlankGrace();
                 return false;
+            }
+            // lastTitle déjà '' mais grâce annulée (faux on_air↑) : ré-armer le blanc.
+            if (isEmpty && !this.inBlank && !this.blankGraceActive) {
+                if (!this._titleBeforeBlank) {
+                    for (let i = this.titleChanges.length - 1; i >= 0; i--) {
+                        const t = String(this.titleChanges[i].title || '').trim();
+                        if (t) {
+                            this._titleBeforeBlank = t;
+                            break;
+                        }
+                    }
+                }
+                this.blankGraceActive = true;
+                this.blankGraceStartedAtMs = performance.now();
+                this.blankGraceStartByte = this.totalBytesWritten;
+                return true;
             }
             if (!(isEmpty && this.inBlank)) return false;
             const last = this.titleChanges[this.titleChanges.length - 1];
@@ -284,6 +421,12 @@ export class AudioRingBuffer {
             return true;
         }
 
+        if (isEmpty) {
+            const prev = String(this.lastTitle || '').trim();
+            if (prev) this._titleBeforeBlank = prev;
+        } else {
+            this._titleBeforeBlank = '';
+        }
         this.lastTitle = title;
 
         if (!isEmpty) {
@@ -298,7 +441,12 @@ export class AudioRingBuffer {
                 this.inBlank = false;
                 this.blankTailRemaining = 0;
             }
-            this._recordTitle(title);
+            const last = this.titleChanges[this.titleChanges.length - 1];
+            if (last?.liveResume && !String(last.title || '').trim()) {
+                last.title = title;
+            } else {
+                this._recordTitle(title);
+            }
         } else if (this.inBlank) {
             this._recordTitle('');
             this._updateOpenBlankMarker();
@@ -356,9 +504,44 @@ export class AudioRingBuffer {
         return found ? current : null;
     }
 
+    _markerAtByte(bytePos) {
+        let cur = null;
+        for (const e of this.titleChanges) {
+            if (e.byteOffset <= bytePos) cur = e;
+            else break;
+        }
+        return cur;
+    }
+
+    _entryIsSpeech(e) {
+        if (!e) return false;
+        if (String(e.title || '').trim()) return true;
+        // Reprise on_air : parole seulement s'il y a un vrai label (ICY ou lastTitle).
+        if (e.liveResume && String(this.lastTitle || '').trim()) return true;
+        return false;
+    }
+
     isBlankAtByte(bytePos) {
-        const title = this.titleForByte(bytePos);
-        return title !== null && !String(title).trim();
+        const e = this._markerAtByte(bytePos);
+        if (!e) return false;
+        if (this._entryIsSpeech(e)) return false;
+        return !String(e.title || '').trim();
+    }
+
+    /** Label à afficher à bytePos (reprise on_air sans titre sur le marqueur). */
+    displayTitleAtByte(bytePos) {
+        const e = this._markerAtByte(bytePos);
+        if (!e) return String(this.lastTitle || '').trim();
+        const own = String(e.title || '').trim();
+        if (own) return own;
+        if (!e.liveResume) return '';
+        for (const n of this.titleChanges) {
+            if (n.byteOffset >= e.byteOffset) {
+                const t = String(n.title || '').trim();
+                if (t) return t;
+            }
+        }
+        return String(this.lastTitle || '').trim();
     }
 
     /** Infos sur le blanc couvrant bytePos (durée sautée à l'ingest, etc.). */
@@ -368,7 +551,7 @@ export class AudioRingBuffer {
             if (e.byteOffset <= bytePos) blank = e;
             else break;
         }
-        if (!blank || String(blank.title || '').trim()) {
+        if (!blank || this._entryIsSpeech(blank)) {
             return { isBlank: false, droppedBlankSec: 0, blankWallMs: 0 };
         }
         let dropped = blank.droppedBlankSec || 0;
@@ -395,12 +578,18 @@ export class AudioRingBuffer {
         return Math.max(fromDropped, wallSec);
     }
 
-    /** Prochain StreamTitle non vide strictement après bytePos. */
+    /** Prochaine parole (titre ICY ou reprise on_air) strictement après bytePos. */
     nextTitleAfterByte(bytePos) {
         for (const e of this.titleChanges) {
-            if (e.byteOffset > bytePos && String(e.title || '').trim()) {
-                return e;
-            }
+            if (e.byteOffset > bytePos && this._entryIsSpeech(e)) return e;
+        }
+        return null;
+    }
+
+    /** Parole à bytePos ou après (reprise déjà sous la tête). */
+    nextTitleAtOrAfterByte(bytePos) {
+        for (const e of this.titleChanges) {
+            if (e.byteOffset >= bytePos && this._entryIsSpeech(e)) return e;
         }
         return null;
     }
@@ -430,6 +619,7 @@ export class AudioRingBuffer {
                 title: lastBefore.title ?? '',
                 droppedBlankSec: lastBefore.droppedBlankSec || 0,
                 blankWallMs: lastBefore.blankWallMs || 0,
+                liveResume: !!lastBefore.liveResume,
             });
         }
         this.titleChanges = kept;
@@ -504,6 +694,9 @@ export class AudioRingBuffer {
         this.blankStartByte = 0;
         this.currentBlankDroppedBytes = 0;
         this._cancelBlankGrace();
+        this._liveSpeech = true;
+        this._heldTitleWhileSpeechOff = null;
+        this._titleBeforeBlank = '';
     }
 
     reset() {
@@ -526,6 +719,9 @@ export class AudioRingBuffer {
         this.blankStartByte = 0;
         this.currentBlankDroppedBytes = 0;
         this._cancelBlankGrace();
+        this._liveSpeech = true;
+        this._heldTitleWhileSpeechOff = null;
+        this._titleBeforeBlank = '';
     }
 }
 
@@ -554,7 +750,12 @@ export class StreamIngestor {
             } catch (err) {
                 if (!this.running) break;
                 this.callbacks.onError?.(err);
-                await this._sleep(this.reconnectDelay);
+                const msg = String(err && err.message ? err.message : err);
+                const transient = /HTTP 50[234]|HTTP 404|Flux terminé|Failed to fetch|NetworkError|Load failed/i.test(msg);
+                const wait = transient
+                    ? Math.min(this.reconnectDelay, 800)
+                    : this.reconnectDelay;
+                await this._sleep(wait);
                 this.reconnectDelay = Math.min(
                     this.reconnectDelay * 2,
                     this.config.reconnectMaxDelayMs,

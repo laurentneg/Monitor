@@ -183,10 +183,99 @@ const icecastProxy = createProxyMiddleware({
     pathFilter: '/stream',
 });
 
+/** Icecast coupe le mount entre deux coms → 404/504. On retente avant d'échouer le navigateur. */
+const STREAM_RETRY_MS = 400;
+const STREAM_RETRY_BUDGET_MS = 12000;
+
+function isRetryableIcecastStatus(code) {
+    return code === 404 || code === 502 || code === 503 || code === 504;
+}
+
+function proxyIcecastWithRetry(req, res, next) {
+    if (req.method !== 'GET') {
+        icecastProxy(req, res, next);
+        return;
+    }
+    const started = Date.now();
+    let target;
+    try {
+        target = new URL(req.originalUrl || req.url, CONFIG.icecastBase);
+    } catch (_) {
+        res.status(502).end('Icecast URL invalide');
+        return;
+    }
+    let upstream = null;
+    let done = false;
+
+    const abortUpstream = () => {
+        if (upstream) {
+            try { upstream.destroy(); } catch (_) {}
+            upstream = null;
+        }
+    };
+    req.on('close', () => {
+        if (!res.writableEnded) abortUpstream();
+        done = true;
+    });
+
+    const fail = () => {
+        if (done || res.headersSent) return;
+        done = true;
+        res.writeHead(504, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end('Icecast indisponible');
+    };
+
+    const attempt = () => {
+        if (done || req.destroyed || res.writableEnded) return;
+        abortUpstream();
+        const headers = Object.assign({}, req.headers);
+        delete headers.host;
+        delete headers.connection;
+        delete headers['content-length'];
+        const ureq = http.request({
+            protocol: target.protocol,
+            hostname: target.hostname,
+            port: target.port || 80,
+            path: target.pathname + target.search,
+            method: 'GET',
+            headers,
+        }, (ures) => {
+            if (done) {
+                ures.resume();
+                return;
+            }
+            const elapsed = Date.now() - started;
+            if (isRetryableIcecastStatus(ures.statusCode) && elapsed < STREAM_RETRY_BUDGET_MS) {
+                ures.resume();
+                setTimeout(attempt, STREAM_RETRY_MS);
+                return;
+            }
+            done = true;
+            const outHeaders = Object.assign({}, ures.headers);
+            delete outHeaders.connection;
+            outHeaders['x-accel-buffering'] = 'no';
+            outHeaders['cache-control'] = 'no-cache, no-store';
+            res.writeHead(ures.statusCode, outHeaders);
+            ures.pipe(res);
+        });
+        upstream = ureq;
+        ureq.on('error', () => {
+            if (done) return;
+            if (Date.now() - started < STREAM_RETRY_BUDGET_MS) {
+                setTimeout(attempt, STREAM_RETRY_MS);
+                return;
+            }
+            fail();
+        });
+        ureq.end();
+    };
+    attempt();
+}
+
 app.use(airbandApiProxy);
 app.use(tetrapolApiProxy);
 if (CONFIG.streamProxy) {
-    app.use(icecastProxy);
+    app.use('/stream', proxyIcecastWithRetry);
 }
 
 app.get('/api/monitor/config', (_req, res) => {
@@ -215,8 +304,10 @@ app.get('/health', (_req, res) => {
 });
 
 const server = http.createServer(app);
-server.keepAliveTimeout = 5000;
-server.headersTimeout = 10000;
+// Plus long que le keep-alive Apache / Icecast (sinon 504 sur les flux MP3).
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 70000;
+server.timeout = 0;
 
 const bridge = new WsBridge({
     airbandWsUrl: CONFIG.airbandWsUrl,
