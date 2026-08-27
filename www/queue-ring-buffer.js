@@ -12,10 +12,12 @@ export const QUEUE_BUFFER_CONFIG = {
     bufferDurationSec: 120,
     // Prébuffer court : démarrer la voix rapidement (évite d'attendre trop longtemps).
     minBufferBeforePlaySec: 0.15,
-    // Blanc conservé / confirmé après fin de StreamTitle (évite coupe franche
-    // si une fin de com est détectée un peu trop tôt).
-    blankMarginSec: 2.0,
-    // Au-delà de blankMarginSec confirmé, le blanc n'est plus stocké.
+    // Après StreamTitle vide : encore blankMarginSec d'audio liés à l'ancien titre.
+    blankMarginSec: 0.7,
+    // Puis blankStoreSec de blanc encore écrit dans le ring, ensuite plus de stockage.
+    blankStoreSec: 2.0,
+    // À la reprise : dernière seconde (preRoll) écrite sous le nouveau StreamTitle.
+    resumePreRollSec: 1.0,
     blankHoldSec: 7.0,
     fallbackBitrate: 64000,
     minValidMetaInt: 1,
@@ -57,7 +59,7 @@ export class AudioRingBuffer {
         this.blankStartedAtMs = 0;
         this.blankStartByte = 0;
         this.currentBlankDroppedBytes = 0;
-        /** StreamTitle vide : encore ~2 s enregistrés comme appartenant à la com. */
+        /** StreamTitle vide : encore ~blankMarginSec enregistrés sous l'ancien titre. */
         this.blankGraceActive = false;
         this.blankGraceStartedAtMs = 0;
         this.blankGraceStartByte = 0;
@@ -99,7 +101,7 @@ export class AudioRingBuffer {
     /**
      * on_air ↑ : recommencer à stocker tout de suite, sans attendre un StreamTitle.
      * Pendant la grâce : annuler (l'audio de marge reste sous l'ancien titre) et
-     * ancrer une reprise à l'offset courant. Pendant inBlank : sortir du drop.
+     * ancrer une reprise à l'offset courant. Pendant inBlank : flush 1 s / marqueur.
      */
     _resumeFromLiveSpeech() {
         if (this.awaitingFirstTitle) return false;
@@ -116,19 +118,7 @@ export class AudioRingBuffer {
             return true;
         }
         if (!this.inBlank) return false;
-        this._finalizeBlankMarker();
-        this.preRoll = [];
-        this.preRollBytes = 0;
-        this.inBlank = false;
-        this.blankTailRemaining = 0;
-        this.titleChanges.push({
-            byteOffset: this.totalBytesWritten,
-            title: '',
-            liveResume: true,
-            droppedBlankSec: 0,
-            blankWallMs: 0,
-        });
-        this._pruneTitles();
+        this._resumeFromBlank('');
         return true;
     }
 
@@ -191,7 +181,7 @@ export class AudioRingBuffer {
             return;
         }
         this._store(chunk);
-        // Après blankMarginSec de StreamTitle vide : confirmer le blanc et arrêter de stocker.
+        // Après blankMarginSec d'audio encore sous l'ancien titre : confirmer le blanc.
         if (this.blankGraceActive) this._maybeConfirmBlankGrace();
     }
 
@@ -208,36 +198,65 @@ export class AudioRingBuffer {
         this._prune();
     }
 
-    _handleBlankAudio(chunk) {
-        // Après confirmation du blanc : ne plus stocker le silence (preRoll pour reprise).
-        // La marge blankMarginSec a déjà été enregistrée pendant blankGrace.
+    _dropBlankChunk(chunk) {
+        if (!chunk || chunk.length === 0) return;
         this.droppedBlankBytes += chunk.length;
         this.currentBlankDroppedBytes += chunk.length;
         this._pushPreRoll(chunk);
+    }
+
+    _handleBlankAudio(chunk) {
+        // Après la grâce : encore blankStoreSec écrits, puis drop + preRoll 1 s.
+        if (this.blankTailRemaining > 0) {
+            const take = Math.min(chunk.length, this.blankTailRemaining);
+            const before = this.totalBytesWritten;
+            this._store(chunk.subarray(0, take));
+            const stored = this.totalBytesWritten - before;
+            this.blankTailRemaining = Math.max(0, this.blankTailRemaining - stored);
+            if (stored < take) {
+                // Tampon plein : le reste n'est plus stocké.
+                this.blankTailRemaining = 0;
+                this._dropBlankChunk(chunk.subarray(stored));
+            } else if (take < chunk.length) {
+                this._dropBlankChunk(chunk.subarray(take));
+            }
+            this._updateOpenBlankMarker();
+            return;
+        }
+        this._dropBlankChunk(chunk);
         this._updateOpenBlankMarker();
     }
 
-    /** Confirme le blanc après blankMarginSec (~2 s) de StreamTitle vide. */
+    /**
+     * Confirme le blanc après blankMarginSec (~0,7 s) d'audio encore attribués
+     * à l'ancien StreamTitle. Le marqueur vide est ancré en fin de fenêtre
+     * (pas au début) pour que ces octets restent sous le talker précédent.
+     */
     _maybeConfirmBlankGrace() {
         if (!this.blankGraceActive || this.inBlank) return;
-        const marginSec = this.config.blankMarginSec || 2;
+        const marginSec = this.config.blankMarginSec || 0.7;
+        const marginBytes = Math.floor((this.bitrate / 8) * marginSec);
+        const heldBytes = Math.max(0, this.totalBytesWritten - this.blankGraceStartByte);
         const elapsedSec = (performance.now() - this.blankGraceStartedAtMs) / 1000;
-        if (elapsedSec < marginSec) return;
+        // Audio tenu OU horloge (flux figé) : ne pas rester en grâce indéfiniment.
+        if (heldBytes < marginBytes && elapsedSec < marginSec) return;
+
+        const blankAt = this.totalBytesWritten;
 
         this.blankGraceActive = false;
         this.inBlank = true;
-        this.blankTailRemaining = 0;
-        this.blankStartedAtMs = this.blankGraceStartedAtMs;
-        this.blankStartByte = this.blankGraceStartByte;
+        this.lastTitle = '';
+        this.blankTailRemaining = this._blankStoreBytes();
+        this.blankStartedAtMs = performance.now();
+        this.blankStartByte = blankAt;
         this.currentBlankDroppedBytes = 0;
 
-        // Ancrer le StreamTitle vide au début de la fenêtre de grâce (les ~2 s
-        // déjà stockés restent dans le ring, liés à ce marqueur).
         this.titleChanges.push({
-            byteOffset: this.blankGraceStartByte,
+            byteOffset: blankAt,
             title: '',
             droppedBlankSec: 0,
-            blankWallMs: elapsedSec * 1000,
+            blankWallMs: 0,
+            titleHoldSec: Math.min(marginSec, Math.max(elapsedSec, heldBytes / Math.max(1, this.bitrate / 8))),
         });
         this.titleChanges.sort((a, b) => a.byteOffset - b.byteOffset);
         this._pruneTitles();
@@ -260,6 +279,11 @@ export class AudioRingBuffer {
         const max = this._marginBytes();
         while (this.preRoll.length > 1 && this.preRollBytes - this.preRoll[0].length >= max) {
             this.preRollBytes -= this.preRoll.shift().length;
+        }
+        if (this.preRoll.length && this.preRollBytes > max) {
+            const drop = this.preRollBytes - max;
+            this.preRoll[0] = this.preRoll[0].subarray(drop);
+            this.preRollBytes -= drop;
         }
     }
 
@@ -321,29 +345,33 @@ export class AudioRingBuffer {
             }
         }
         if (!isEmpty && !this._liveSpeech) {
-            // Titre ICY pendant listing off : retenir pour on_air↑, ne pas écrire
-            // de blanc artificiel dans titleChanges (le stream a encore ce label).
-            this._heldTitleWhileSpeechOff = { title, at: performance.now() };
-            if (typeof window !== 'undefined' && window.__MONITOR_DEBUG__) {
-                console.log(
-                    '%c[debug:ring]%c addTitleChange',
-                    'background:#2e7d32;color:#fff;padding:1px 6px;border-radius:3px',
-                    'color:inherit',
-                    {
-                        t: new Date().toISOString().slice(11, 23),
-                        StreamTitle: '(held)',
-                        raw: rawTitle,
-                        coerceReason: 'live-speech-off',
-                        liveSpeech: this._liveSpeech,
-                        awaitingFirstTitle: this.awaitingFirstTitle,
-                        inBlank: this.inBlank,
-                        blankGraceActive: this.blankGraceActive,
-                        lastTitle: this.lastTitle,
-                        bytesWritten: this.totalBytesWritten,
-                    }
-                );
+            // Listing off pendant un vrai blanc / grâce : retenir (titre collé), ne pas écrire.
+            if (this.inBlank || this.blankGraceActive) {
+                this._heldTitleWhileSpeechOff = { title, at: performance.now() };
+                if (typeof window !== 'undefined' && window.__MONITOR_DEBUG__) {
+                    console.log(
+                        '%c[debug:ring]%c addTitleChange',
+                        'background:#2e7d32;color:#fff;padding:1px 6px;border-radius:3px',
+                        'color:inherit',
+                        {
+                            t: new Date().toISOString().slice(11, 23),
+                            StreamTitle: '(held)',
+                            raw: rawTitle,
+                            coerceReason: 'live-speech-off',
+                            liveSpeech: this._liveSpeech,
+                            awaitingFirstTitle: this.awaitingFirstTitle,
+                            inBlank: this.inBlank,
+                            blankGraceActive: this.blankGraceActive,
+                            lastTitle: this.lastTitle,
+                            bytesWritten: this.totalBytesWritten,
+                        }
+                    );
+                }
+                return false;
             }
-            return false;
+            // Listing déjà off mais le mount envoie encore un talker (com courte :
+            // on_air↓ avant l'ICY) — faire confiance au StreamTitle, ne pas le jeter.
+            coerceReason = coerceReason || 'listing-lag-accept';
         }
 
         if (typeof window !== 'undefined' && window.__MONITOR_DEBUG__) {
@@ -427,49 +455,101 @@ export class AudioRingBuffer {
         } else {
             this._titleBeforeBlank = '';
         }
-        this.lastTitle = title;
 
         if (!isEmpty) {
-            // Reprise pendant la marge de 2 s : annuler, l'audio a déjà été gardé.
+            this.lastTitle = title;
+            // Reprise pendant la marge : annuler, l'audio a déjà été gardé sous l'ancien titre.
             this._cancelBlankGrace();
             if (this.inBlank) {
-                this._finalizeBlankMarker();
-                // Ne pas réinjecter un long preRoll de silence : le ring a déjà
-                // gardé blankMarginSec pendant la grâce ; lecture continue sans trou.
-                this.preRoll = [];
-                this.preRollBytes = 0;
-                this.inBlank = false;
-                this.blankTailRemaining = 0;
-            }
-            const last = this.titleChanges[this.titleChanges.length - 1];
-            if (last?.liveResume && !String(last.title || '').trim()) {
-                last.title = title;
+                this._resumeFromBlank(title);
             } else {
-                this._recordTitle(title);
+                const last = this.titleChanges[this.titleChanges.length - 1];
+                if (last?.liveResume && !String(last.title || '').trim()) {
+                    last.title = title;
+                } else {
+                    this._recordTitle(title);
+                }
             }
         } else if (this.inBlank) {
+            this.lastTitle = '';
             this._recordTitle('');
             this._updateOpenBlankMarker();
         } else if (!this.blankGraceActive) {
-            // Début de grâce : continuer d'enregistrer ~2 s comme appartenant à la com
-            // (ancien StreamTitle toujours actif dans titleChanges). Pas de drop encore.
+            // Début de grâce : lastTitle reste le talker ; encore blankMarginSec
+            // d'audio stockés sous ce titre, puis marqueur vide en fin de fenêtre.
             this.blankGraceActive = true;
             this.blankGraceStartedAtMs = performance.now();
             this.blankGraceStartByte = this.totalBytesWritten;
+        } else {
+            this._maybeConfirmBlankGrace();
         }
         return true;
     }
 
     _recordTitle(title) {
-        // Toujours enregistrer le titre (même vide) lié à l'offset audio courant,
-        // pour qu'un tour de ring n'affiche pas un vieux StreamTitle.
+        this._recordTitleAt(title, this.totalBytesWritten);
+    }
+
+    _recordTitleAt(title, byteOffset) {
+        const off = Math.max(
+            this.oldestByteOffset,
+            Math.min(byteOffset, this.totalBytesWritten)
+        );
         this.titleChanges.push({
-            byteOffset: this.totalBytesWritten,
+            byteOffset: off,
             title: String(title ?? ''),
             droppedBlankSec: 0,
             blankWallMs: 0,
         });
+        this.titleChanges.sort((a, b) => a.byteOffset - b.byteOffset);
         this._pruneTitles();
+    }
+
+    /**
+     * Sortie de blanc : dernière seconde sous le nouveau titre (ou liveResume).
+     * Encore dans les 2 s stockées → marqueur à now-1s (borné au début du blanc).
+     * Déjà en drop → flush du preRoll 1 s puis marqueur au début du flush.
+     */
+    _resumeFromBlank(title) {
+        const oneSec = this._resumePreRollBytes();
+        const blankStart = this.blankStartByte || this.oldestByteOffset;
+        const wasStoringTail = this.blankTailRemaining > 0;
+        this._finalizeBlankMarker();
+        this.inBlank = false;
+        this.blankTailRemaining = 0;
+        const labeled = String(title || '').trim();
+        if (wasStoringTail) {
+            this.preRoll = [];
+            this.preRollBytes = 0;
+            const resumeAt = Math.max(blankStart, this.totalBytesWritten - oneSec);
+            if (labeled) {
+                this._recordTitleAt(labeled, resumeAt);
+            } else {
+                this.titleChanges.push({
+                    byteOffset: resumeAt,
+                    title: '',
+                    liveResume: true,
+                    droppedBlankSec: 0,
+                    blankWallMs: 0,
+                });
+                this._pruneTitles();
+            }
+            return;
+        }
+        const resumeAt = this.totalBytesWritten;
+        this._flushPreRoll();
+        if (labeled) {
+            this._recordTitleAt(labeled, resumeAt);
+        } else {
+            this.titleChanges.push({
+                byteOffset: resumeAt,
+                title: '',
+                liveResume: true,
+                droppedBlankSec: 0,
+                blankWallMs: 0,
+            });
+            this._pruneTitles();
+        }
     }
 
     _updateOpenBlankMarker() {
@@ -567,12 +647,12 @@ export class AudioRingBuffer {
 
     /**
      * Secondes de blanc réellement écoulées à bytePos :
-     * marge conservée dans le ring (~2 s) + silence sauté + wall clock si plus fiable.
+     * marge conservée sous l'ancien titre (~0,7 s) + silence sauté + wall clock.
      */
     effectiveBlankSecAt(bytePos) {
         const info = this.blankInfoAtByte(bytePos);
         if (!info.isBlank) return 0;
-        const kept = this.config.blankMarginSec || 2;
+        const kept = this.config.blankMarginSec || 0.7;
         const wallSec = (info.blankWallMs || 0) / 1000;
         const fromDropped = info.droppedBlankSec + Math.min(kept, wallSec);
         return Math.max(fromDropped, wallSec);
@@ -674,8 +754,18 @@ export class AudioRingBuffer {
         this.readByteOffset = Math.max(this.oldestByteOffset, this.totalBytesWritten - back);
     }
 
+    _blankStoreBytes() {
+        const sec = this.config.blankStoreSec || 2.0;
+        return Math.floor((this.bitrate / 8) * sec);
+    }
+
+    _resumePreRollBytes() {
+        const sec = this.config.resumePreRollSec || 1.0;
+        return Math.floor((this.bitrate / 8) * sec);
+    }
+
     _marginBytes() {
-        return Math.floor((this.bitrate / 8) * this.config.blankMarginSec);
+        return this._resumePreRollBytes();
     }
 
     /**

@@ -21,10 +21,8 @@
     }
     const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/monitor';
     const OFF_AIR_GRACE_MS = 5000; // drop empty exclusive queue items after off-air grace
-    // Fin de com : blanc gardé dans le ring (blankMarginSec), puis hold avant fermeture.
-    // Airband : +1 s de blanc (ringConfigForEntry) pour allonger sans couper le stream.
+    // Fin de com : encore blankMarginSec (0,7 s) sous l'ancien StreamTitle, puis hold 7 s.
     const STREAM_END_HOLD_MS = 7000;
-    const AIRBAND_BLANK_EXTRA_SEC = 1.0;
     /** Ignorer les parasites : ne pas ouvrir une carte avant 100 ms de com continue. */
     const MIN_ON_AIR_START_MS = 100;
     /** Tetrapol : après on_air↑, délai max sans StreamTitle avant de considérer la com fantôme. */
@@ -57,7 +55,8 @@
     let tetrapolBridged = false;
     let airbandBridged = false;
     let audioEnabled = false;
-    let exclusivePlaybackMode = localStorage.getItem('exclusivePlaybackMode') === 'true';
+    let exclusivePlaybackMode = mseMpegSupported()
+        && localStorage.getItem('exclusivePlaybackMode') === 'true';
     let forceBeforeFull = localStorage.getItem('exclusiveForceBeforeBufferFull') !== 'false';
     let disabledAirband = new Set(JSON.parse(localStorage.getItem('disabledAirbandStreams') || '[]').map(String));
     let disabledTetrapol = new Set(JSON.parse(localStorage.getItem('disabledTetrapolGroups') || '[]').map(String));
@@ -156,6 +155,7 @@
         channelsStatus: document.getElementById('channelsStatusIndicator'),
         activateAudio: document.getElementById('activateAudio'),
         exclusiveToggle: document.getElementById('exclusivePlaybackToggle'),
+        exclusivePlaybackControl: document.getElementById('exclusivePlaybackControl'),
         exclusiveForceToggle: document.getElementById('exclusiveForceBufferToggle'),
         exclusiveForceControl: document.getElementById('exclusiveForceBufferControl'),
         volumeSlider: document.getElementById('globalVolumeSlider'),
@@ -194,6 +194,41 @@
 
     function airKey(streamId) { return 'ab:' + streamId; }
     function tpKey(groupId) { return 'tp:' + groupId; }
+
+    function getAirbandChannel(id) {
+        if (id == null || id === '') return undefined;
+        if (airbandById.has(id)) return airbandById.get(id);
+        const s = String(id);
+        if (airbandById.has(s)) return airbandById.get(s);
+        const n = Number(id);
+        if (Number.isFinite(n) && airbandById.has(n)) return airbandById.get(n);
+        return undefined;
+    }
+
+    /**
+     * On-air Pulse = listing / boutons streaming (canaux), pas la télémétrie mixer
+     * qui arrive en retard ou reste collée.
+     */
+    function pulseGroupOnAir(source, gid, entry, pe) {
+        const id = gid != null && gid !== '' ? gid : (entry && entry.rawId);
+        const src = source || (entry && entry.source);
+        if (src === 'tetrapol' && id != null && id !== '') {
+            return tetrapolGroupIsOnAir(id);
+        }
+        if (src === 'airband' && id != null && id !== '') {
+            const ch = getAirbandChannel(id);
+            if (ch) return !!ch.on_air;
+            const cat = catalog.get(airKey(id)) || catalog.get(airKey(String(id)));
+            if (cat) return !!cat.on_air;
+        }
+        if (entry && entry.on_air != null) return !!entry.on_air;
+        return !!(pe && pe.on_air);
+    }
+
+    function pulseGroupIsPlaying(source, gid, displayActiveId, displayActiveSource) {
+        if (!displayActiveId) return false;
+        return displayActiveSource === source && String(gid) === String(displayActiveId);
+    }
 
     function saveDisabled() {
         localStorage.setItem('disabledAirbandStreams', JSON.stringify([...disabledAirband]));
@@ -2219,14 +2254,20 @@
         return !!(entry && entry.on_air);
     }
 
-    /** Parole live réelle (ring) = StreamTitle non vide, pas le listing on_air seul. */
+    /** Listing encore actif (Tetrapol ou airband) — ne pas fermer sur un blanc ICY transitoire. */
+    function catalogKeyIsOnAir(key) {
+        if (!key) return false;
+        const entry = catalog.get(key);
+        return !!(entry && entry.on_air);
+    }
+
+    /** Parole live réelle (ring) = StreamTitle non vide, y compris pendant la marge 0,7 s. */
     function ringHasLiveTalk(seg) {
         const rb = seg?.ringBuffer;
         if (!rb) return false;
         if (rb.inBlank) return false;
         const title = String(rb.lastTitle || '').trim();
         if (!title) return false;
-        if (rb.blankGraceActive) return false;
         return true;
     }
 
@@ -2241,6 +2282,21 @@
     }
 
     function stopEntryAfterBlank(key) {
+        // Groupe / canal encore on_air : une com non vide peut suivre le blanc ICY.
+        if (catalogKeyIsOnAir(key)) {
+            const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
+                || exclusiveQueue.find((s) => s.key === key)
+                || null;
+            if (liveSeg) {
+                debugStreamTitleLog('blank-close-skipped-on_air', {
+                    key,
+                    groupLabel: labelOf(catalogEntryFor(liveSeg)),
+                    path: 'listing-still-active'
+                });
+                clearBlankHoldForSpeech(liveSeg);
+            }
+            return;
+        }
         const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
             || exclusiveQueue.find((s) => s.key === key)
             || null;
@@ -2252,6 +2308,20 @@
             });
             clearBlankHoldForSpeech(liveSeg);
             maybeSkipBlankToNextTransmission(liveSeg);
+            return;
+        }
+        // Préempté / en file avec audio restant : ne pas jeter — reprendre après la prio.
+        if (liveSeg
+            && exclusiveActive !== liveSeg
+            && segmentHasRingContent(liveSeg)) {
+            debugStreamTitleLog('blank-close-skipped-queued', {
+                key,
+                groupLabel: labelOf(catalogEntryFor(liveSeg)),
+                unreadSec: Number((getRingWaitingSeconds(liveSeg) || 0).toFixed(2)),
+                path: 'preempt-keep-buffer'
+            });
+            clearBlankHoldForSpeech(liveSeg);
+            liveSeg.pendingFinishAfterDrain = true;
             return;
         }
         blankClosedOnAirGen.set(key, onAirGeneration.get(key) || 0);
@@ -2465,12 +2535,24 @@
             }
         }
 
-        // Toujours seekToByte(next) quand on a un marqueur de titre — jumpToLive
-        // vise la fin du tampon MSE qui contient encore le blanc de grâce.
+        // Prefer seekToByte(title). jumpToLive only if almost caught up — otherwise
+        // it dumps the whole catch-up buffer (gauge empties, card dies).
+        const waiting = getRingWaitingSeconds(seg);
         let action;
         if (resumeAt && typeof bp.seekToByte === 'function') {
-            action = bp.seekToByte(resumeAt.byteOffset);
-        } else if (typeof bp.jumpToLive === 'function') {
+            const target = resumeAt.byteOffset;
+            // Ne pas seek sur un marqueur liveResume vide à la fin du ring (= live).
+            const isLiveEdgeResume = !!resumeAt.liveResume
+                && !String(resumeAt.title || '').trim()
+                && target >= (rb.totalBytesWritten - 64);
+            if (!isLiveEdgeResume) {
+                action = bp.seekToByte(target);
+            } else if (waiting <= 0.5 && typeof bp.jumpToLive === 'function') {
+                action = bp.jumpToLive();
+            } else {
+                action = Promise.resolve();
+            }
+        } else if (waiting <= 0.5 && typeof bp.jumpToLive === 'function') {
             action = bp.jumpToLive();
         } else {
             action = Promise.resolve();
@@ -2502,12 +2584,15 @@
 
     function getSegmentDisplayTitle(seg) {
         if (!seg) return '';
-        // Listing off + hold 7 s : ne pas coller le talker encore présent dans titleChanges
-        // (on_air↓ n'écrit plus de blanc artificiel dans le ring).
+        // Listing off + hold : cacher le label seulement si plus rien à jouer
+        // (sinon les coms < 1 s perdent le titre alors que l'audio est encore dans le ring).
         if (String(seg.key || '').startsWith('tp:')
             && !tetrapolKeyIsOnAir(seg.key)
             && (blankDeadlines[seg.key] || blankTimers[seg.key])) {
-            return '';
+            const stillPlaying = segmentHasRingContent(seg)
+                || ringHasLiveTalk(seg)
+                || (getRingWaitingSeconds(seg) > 0.15 && !isPlaybackInBlank(seg));
+            if (!stillPlaying) return '';
         }
         if (exclusiveActive === seg && seg.bufferPlayer?.hasStarted) {
             return getRingBufferDisplayTitle(seg);
@@ -2521,6 +2606,32 @@
         const seg = (exclusiveActive?.key === key ? exclusiveActive : null)
             || exclusiveQueue.find(s => s.key === key)
             || null;
+        // Tampon encore à vider (com courte) : rester en lecture, pas « En attente ».
+        if (seg && usesQueueRingBuffer()) {
+            const waiting = getRingWaitingSeconds(seg);
+            const draining = waiting > 0.2
+                && !isPlaybackInBlank(seg)
+                && (segmentHasRingContent(seg) || ringHasLiveTalk(seg));
+            if (draining) {
+                if (seg.card) {
+                    seg.card.classList.remove('ending');
+                    seg.card.classList.add('playing');
+                    const st = seg.card.querySelector('.card-status');
+                    if (st) {
+                        st.textContent = waiting > getLiveWaitingThreshold()
+                            ? `Rattrapage (${waiting.toFixed(1)}s)`
+                            : 'En cours';
+                    }
+                    const entry = catalogEntryFor(seg);
+                    updateCardHeader(seg.card, entry, {
+                        txTitle: getSegmentDisplayTitle(seg),
+                        role: queueRoleLabel(seg, exclusiveActive === seg),
+                        groupLabel: segmentDisplayName(seg)
+                    });
+                }
+                return;
+            }
+        }
         const remainingMs = Math.max(0, deadline - Date.now());
         const remainingSec = Math.ceil(remainingMs / 1000);
         const text = remainingSec > 0 ? `En attente (${remainingSec}s)` : 'Fermeture…';
@@ -2557,6 +2668,9 @@
         if (blankTimers[key]) return;
         // Fenêtre post-on_air↑ : attendre un StreamTitle avant de relancer le hold 7 s.
         if (onAirTitleWaitTimers.has(key)) return;
+        // Listing encore actif : blanc ICY ≠ fin de com (airband surtout).
+        // force = on_air↓ explicite (listing déjà faux).
+        if (!opts.force && catalogKeyIsOnAir(key)) return;
         const holdSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
             || exclusiveQueue.find(s => s.key === key)
             || null;
@@ -2593,6 +2707,11 @@
                 maybeSkipBlankToNextTransmission(liveSeg);
                 return;
             }
+            // En file avec tampon : garder pour reprise (préemption prio).
+            if (liveSeg && exclusiveActive !== liveSeg && segmentHasRingContent(liveSeg)) {
+                liveSeg.pendingFinishAfterDrain = true;
+                return;
+            }
             if (ingestIsReconnecting(liveSeg)) return;
             if (!liveSeg || liveEdgeIsBlank(liveSeg)) stopEntryAfterBlank(key);
             return;
@@ -2616,18 +2735,35 @@
             const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
                 || exclusiveQueue.find((s) => s.key === key);
             // Nouvelle com dans le tampon / en cours : sauter le blanc, ne pas fermer.
-            if (liveSeg && (getTitleAheadOfPlayback(liveSeg) || playbackHasSpeech(liveSeg)
-                || ringHasLiveTalk(liveSeg))) {
+            if (liveSeg && (getTitleAheadOfPlayback(liveSeg) || playbackHasSpeech(liveSeg))) {
+                maybeSkipBlankToNextTransmission(liveSeg);
+                return;
+            }
+            const waiting = liveSeg ? getRingWaitingSeconds(liveSeg) : 0;
+            // En file (préempté ou jamais lu) avec audio : attendre la promotion.
+            if (liveSeg
+                && exclusiveActive !== liveSeg
+                && (segmentHasRingContent(liveSeg) || ringHasLiveTalk(liveSeg)
+                    || getTitleAheadOfPlayback(liveSeg) || waiting > 0.3)) {
+                liveSeg.pendingFinishAfterDrain = true;
+                return;
+            }
+            // Listing off + tampon vidé : fermer même si un StreamTitle est encore collé dans le ring.
+            if (liveSeg && String(key).startsWith('tp:') && !tetrapolKeyIsOnAir(key) && waiting <= 0.3) {
+                stopEntryAfterBlank(key);
+                return;
+            }
+            if (liveSeg && ringHasLiveTalk(liveSeg)) {
                 maybeSkipBlankToNextTransmission(liveSeg);
                 return;
             }
             if (liveSeg && !liveEdgeIsBlank(liveSeg)) return;
 
             if (liveSeg && usesQueueRingBuffer()) {
-                const waiting = getRingWaitingSeconds(liveSeg);
-                if (waiting > 0.3 && !liveEdgeIsBlank(liveSeg)) {
+                // Tampon encore à lire (même si le live est déjà blanc).
+                if (waiting > 0.3) {
                     liveSeg.pendingFinishAfterDrain = true;
-                    if (liveSeg.card) {
+                    if (liveSeg.card && exclusiveActive === liveSeg) {
                         liveSeg.card.classList.add('ending');
                         const st = liveSeg.card.querySelector('.card-status');
                         if (st) st.textContent = 'Fin du tampon…';
@@ -2735,21 +2871,52 @@
         const isTetrapol = (entry.source === 'tetrapol')
             || String(key).startsWith('tp:');
 
-        // Analogique : ne jamais coupler on_air au ring (com déjà off-air en file).
+        // Analogique : comme Tetrapol — ne pas injecter de blanc dans le ring sur
+        // on_air↓ (coms courtes en file : sinon tampon vidé → carte fermée sans lecture).
         if (!isTetrapol) {
+            if (onAir && was !== true) {
+                // Front montant : reprendre le stockage / annuler un hold lancé sur blanc ICY.
+                if (seg?.ringBuffer && typeof seg.ringBuffer.setLiveSpeech === 'function') {
+                    seg.ringBuffer.setLiveSpeech(true);
+                }
+                if (seg) {
+                    clearBlankHoldForSpeech(seg);
+                    if (exclusiveActive === seg) maybeSkipBlankToNextTransmission(seg);
+                    debugStreamTitleLog('on_air-resume', {
+                        key,
+                        source: entry?.source || '?',
+                        groupLabel: labelOf(entry),
+                        ringInBlank: !!seg.ringBuffer?.inBlank,
+                        blankGraceActive: !!seg.ringBuffer?.blankGraceActive,
+                        path: 'on_air-rising-edge'
+                    });
+                }
+                return;
+            }
             if (was === true && !onAir) {
-                if (seg?.ringBuffer && typeof seg.ringBuffer.addTitleChange === 'function') {
-                    if (!seg.ringBuffer.awaitingFirstTitle) {
-                        seg.ringBuffer.addTitleChange({ StreamTitle: '' });
-                        debugStreamTitleLog('blank-from-on_air', {
-                            key,
-                            source: entry?.source || '?',
-                            groupLabel: labelOf(entry),
-                            StreamTitle: '(empty)',
-                            path: 'on_air-falling-edge'
-                        });
+                if (seg?.ringBuffer && typeof seg.ringBuffer.setLiveSpeech === 'function') {
+                    seg.ringBuffer.setLiveSpeech(false);
+                }
+                if (seg && !seg.ringBuffer?.awaitingFirstTitle) {
+                    debugStreamTitleLog('blank-from-on_air', {
+                        key,
+                        source: entry?.source || '?',
+                        groupLabel: labelOf(entry),
+                        StreamTitle: '(empty)',
+                        ringLastTitle: String(seg.ringBuffer?.lastTitle || '').trim() || '(empty)',
+                        unreadSec: Number((getRingWaitingSeconds(seg) || 0).toFixed(2)),
+                        path: 'on_air-falling-edge-ui-only'
+                    });
+                    if (!segmentHasRingContent(seg) && !ringHasLiveTalk(seg)) {
+                        seg.ringLastTitle = '';
+                        lastStreamTitles[key] = '';
                     }
-                } else {
+                    syncRingBufferTitleDisplay(seg);
+                    // Countdown seulement en lecture ; en file, garder le tampon jusqu'au tour.
+                    if (exclusiveActive === seg) {
+                        armBlankCountdown(key, { force: true });
+                    }
+                } else if (!seg) {
                     const hadTitle = !!(lastStreamTitles[key] || '').trim()
                         || !!(players.get(key));
                     if (hadTitle) handleStreamMetadata(key, '');
@@ -2772,10 +2939,15 @@
                     groupLabel: labelOf(entry),
                     StreamTitle: '(empty)',
                     ringLastTitle: String(seg.ringBuffer?.lastTitle || '').trim() || '(empty)',
+                    unreadSec: Number((getRingWaitingSeconds(seg) || 0).toFixed(2)),
                     path: 'on_air-falling-edge-ui-only'
                 });
-                seg.ringLastTitle = '';
-                lastStreamTitles[key] = '';
+                // Ne pas effacer le label tant qu'il reste de l'audio / un titre ring :
+                // les coms < 1 s ont souvent on_air↓ avant la fin de lecture.
+                if (!segmentHasRingContent(seg) && !ringHasLiveTalk(seg)) {
+                    seg.ringLastTitle = '';
+                    lastStreamTitles[key] = '';
+                }
                 syncRingBufferTitleDisplay(seg);
                 armBlankCountdown(key, { force: true });
             }
@@ -2847,7 +3019,8 @@
             } else if (!t && seg) {
                 lastStreamTitles[key] = '';
                 const waiting = getRingWaitingSeconds(seg);
-                if (isPlaybackInBlank(seg) || waiting <= 0.5 || !seg.bufferPlayer?.hasStarted) {
+                if (!catalogKeyIsOnAir(key)
+                    && (isPlaybackInBlank(seg) || waiting <= 0.5 || !seg.bufferPlayer?.hasStarted)) {
                     armBlankCountdown(key);
                 }
             }
@@ -3073,20 +3246,11 @@
         return window.QueueRingBufferKit || null;
     }
 
-    /**
-     * Config ring : pour Airband, garder +1 s de blanc dans le tampon après fin de
-     * StreamTitle / on_air, sans couper l'ingestion Icecast (pas de drop trop tôt).
-     */
+    /** Config ring commune (Tetrapol + airband) : blankMarginSec = 0,7 s sous l'ancien titre. */
     function ringConfigForSegment(seg) {
         const kit = getRingBufferKit();
         const base = kit?.QUEUE_BUFFER_CONFIG || {};
         if (seg?.ringConfig) return seg.ringConfig;
-        const entry = catalogEntryFor(seg) || seg?.entry;
-        if (entry?.source === 'airband') {
-            const margin = (base.blankMarginSec ?? 2) + AIRBAND_BLANK_EXTRA_SEC;
-            seg.ringConfig = { ...base, blankMarginSec: margin };
-            return seg.ringConfig;
-        }
         seg.ringConfig = base;
         return base;
     }
@@ -3122,8 +3286,10 @@
                 }
                 updateRingProgressBar(seg);
                 updatePlaybackBlankState(seg);
+                // Toujours rafraîchir le label (même pendant le hold 7 s) — sinon le
+                // titre ICY arrivé après on_air↓ n'apparaît jamais sur la carte.
+                syncRingBufferTitleDisplay(seg);
                 if (blankDeadlines[seg.key]) updateEndingStatus(seg.key);
-                else syncRingBufferTitleDisplay(seg);
                 maybeForcePromoteNearFullBuffer(seg);
                 if (exclusiveActive === seg) applyBlankPlaybackFallback(seg);
                 maybeFinishRingSegment(seg);
@@ -3179,15 +3345,13 @@
         const bytePos = typeof bp.playbackByteOffset === 'function'
             ? bp.playbackByteOffset()
             : rb.readByteOffset;
+        // Toujours le titre à la tête de lecture — pas l'état live (grâce / inBlank),
+        // sinon le label disparaît alors que l'audio de la com est encore joué.
         if (typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos)) {
+            // Tête dans le blanc, mais une reprise live a déjà un label.
             if (!rb.inBlank && String(rb.lastTitle || '').trim()) {
                 return String(rb.lastTitle).trim();
             }
-            return '';
-        }
-        // Live déjà en blanc / grâce après on_air↓ : ne pas coller l'ancien talker
-        // tant que la tête de lecture n'a pas rattrapé le marqueur vide.
-        if (rb.inBlank || (rb.blankGraceActive && !String(rb.lastTitle || '').trim())) {
             return '';
         }
         if (typeof rb.displayTitleAtByte === 'function') {
@@ -3200,22 +3364,35 @@
                 return String(titleAtPos).trim();
             }
         }
-        return (seg.ringLastTitle || lastStreamTitles[seg.key] || '').trim();
+        // Lecture encore avant le 1er marqueur : afficher le live / dernier titre connu.
+        return (String(rb.lastTitle || '').trim()
+            || seg.ringLastTitle
+            || lastStreamTitles[seg.key]
+            || '').trim();
     }
 
     function syncRingBufferTitleDisplay(seg) {
         if (!seg?.card || !seg.ringBuffer) return;
         const entry = catalogEntryFor(seg);
         const display = getSegmentDisplayTitle(seg);
-        // Lecture déjà sur un vrai titre : le hold 7 s d'un blanc précédent
-        // ne doit plus fermer la carte (ni rester affiché « En attente »).
+        // Lecture déjà sur un vrai titre : mettre à jour le label ; n'annuler le hold
+        // que si ce n'est pas un titre collé pendant listing off (drain com courte).
         if (display && exclusiveActive === seg && seg.bufferPlayer?.hasStarted) {
-            lastNonEmptyStreamTitles[seg.key] = display;
             seg.ringLastTitle = display;
-            if (blankDeadlines[seg.key] || blankTimers[seg.key]
-                || seg.playbackBlankSinceMs != null) {
-                clearBlankHoldForSpeech(seg);
-                maybeSkipBlankToNextTransmission(seg);
+            const ending = !!(blankDeadlines[seg.key] || blankTimers[seg.key]
+                || seg.playbackBlankSinceMs != null);
+            if (ending) {
+                const listingOff = String(seg.key || '').startsWith('tp:')
+                    && !tetrapolKeyIsOnAir(seg.key);
+                if (listingOff && isStickyIcyTitle(seg.key, display)) {
+                    // garder le countdown, afficher le talker pendant le rattrapage
+                } else {
+                    lastNonEmptyStreamTitles[seg.key] = display;
+                    clearBlankHoldForSpeech(seg);
+                    maybeSkipBlankToNextTransmission(seg);
+                }
+            } else {
+                lastNonEmptyStreamTitles[seg.key] = display;
             }
         }
         if (window.__MONITOR_DEBUG__) {
@@ -3404,7 +3581,8 @@
             && !rb.blankGraceActive
             && ringTitle === title);
         if (acceptedSpeech) {
-            // Titre collé pendant hold alors que le listing est off : ne pas annuler le countdown.
+            // Titre collé pendant hold + listing off : ne pas annuler le countdown.
+            // Nouveau talker (y compris com courte : titre après on_air↓) : accepter.
             const listingOff = String(seg.key || '').startsWith('tp:') && !tetrapolKeyIsOnAir(seg.key);
             const ending = !!(blankDeadlines[seg.key] || blankTimers[seg.key]
                 || seg.playbackBlankSinceMs != null);
@@ -3421,12 +3599,23 @@
                 seg.ringLastTitle = title;
                 seg.analyzerConfirmedEnded = false;
                 clearBlankHoldForSpeech(seg);
-                if (exclusiveActive === seg) maybeSkipBlankToNextTransmission(seg);
+                if (exclusiveActive === seg) {
+                    maybeSkipBlankToNextTransmission(seg);
+                    maybeResumeActiveRingPlayback(seg);
+                }
             }
         }
         if (ringBlank && exclusiveActive === seg) {
             seg.ringLastTitle = '';
-            armBlankCountdown(seg.key);
+            if (catalogKeyIsOnAir(seg.key)) {
+                // Listing encore actif : ne pas lancer le hold 7 s (prochaine com possible).
+                if (blankDeadlines[seg.key] || blankTimers[seg.key]
+                    || seg.playbackBlankSinceMs != null) {
+                    clearBlankHoldForSpeech(seg);
+                }
+            } else {
+                armBlankCountdown(seg.key);
+            }
         }
         // Les métadonnées live alimentent le ring buffer ; l'affichage suit la lecture.
         syncRingBufferTitleDisplay(seg);
@@ -3453,9 +3642,17 @@
     }
 
     function maybeForcePromoteNearFullBuffer(seg) {
-        if (!forceBeforeFull || !seg?.ringBuffer) return;
+        if (!seg?.ringBuffer) return;
         if (!exclusiveQueue.includes(seg) || seg.suspendedByUser) return;
-        if (seg.ringBuffer.fillRatio < RING_FORCE_PROMOTE_RATIO) return;
+        const rb = seg.ringBuffer;
+        const fill = rb.fillRatio;
+        const saturated = fill >= 1
+            || (rb.maxBytes > 0 && rb.unreadBytes >= rb.maxBytes);
+        // Option ON : bascule dès 92 %. Option OFF : seulement à saturation réelle.
+        const shouldPromote = forceBeforeFull
+            ? fill >= RING_FORCE_PROMOTE_RATIO
+            : saturated;
+        if (!shouldPromote) return;
 
         if (!exclusiveActive) {
             exclusiveQueue = exclusiveQueue.filter(s => s.key !== seg.key);
@@ -3484,6 +3681,7 @@
 
         active.suspendedByUser = false;
         active.manualPriority = false;
+        clearBlankHoldForSpeech(active);
         exclusiveQueue.unshift(active);
         stopExclusivePlay(active, { keepBuffer: true });
         exclusiveQueue = exclusiveQueue.filter(s => s.key !== seg.key);
@@ -3605,7 +3803,8 @@
             || String(seg.key || '').startsWith('tp:');
         if (isTetrapol && ringHasLiveTalk(seg)) return true;
         if (isTetrapol && !ringHasLiveTalk(seg)) return false;
-        if (!rb.inBlank && !rb.blankGraceActive && String(rb.lastTitle || '').trim()) return true;
+        // Grâce 0,7 s : lastTitle encore le talker → parole.
+        if (!rb.inBlank && String(rb.lastTitle || '').trim()) return true;
         return false;
     }
 
@@ -3628,6 +3827,16 @@
      */
     function applyBlankPlaybackFallback(seg) {
         if (!seg || exclusiveActive !== seg || !seg.bufferPlayer?.hasStarted) return false;
+        // Listing encore on_air : blanc ICY = trou, pas fin de carte.
+        if (catalogKeyIsOnAir(seg.key)) {
+            if (blankDeadlines[seg.key] || blankTimers[seg.key]
+                || seg.playbackBlankSinceMs != null
+                || (seg.card && seg.card.classList.contains('ending'))) {
+                clearBlankHoldForSpeech(seg);
+            }
+            seg._uiBlankSinceMs = null;
+            return false;
+        }
         const speech = playbackHasSpeech(seg);
         const hasBlank = ringReportsBlank(seg);
         const playingBlank = isPlaybackInBlank(seg)
@@ -3685,6 +3894,8 @@
         const ageMs = performance.now() - (seg.createdAtMs || 0);
         const rb = seg.ringBuffer;
         // Attente 1er titre expirée, jamais de parole tamponnée → carte inactive.
+        // Ne pas fermer tant que le listing est encore on_air (airband inclus :
+        // tetrapolKeyIsOnAir ne couvre que tp:*, et le titre ICY peut arriver tard).
         if (!seg.bufferPlayer?.hasStarted) {
             const waitMax = rb?.config?.firstTitleWaitMaxMs || 3500;
             if (ageMs >= waitMax + 500
@@ -3693,7 +3904,8 @@
                 && liveEdgeIsBlank(seg)
                 && !segmentHasRingContent(seg)
                 && !String(rb.lastTitle || '').trim()) {
-                if (!ingestIsReconnecting(seg) && !tetrapolKeyIsOnAir(seg.key)) stopEntry(seg.key);
+                const stillOnAir = catalogKeyIsOnAir(seg.key);
+                if (!ingestIsReconnecting(seg) && !stillOnAir) stopEntry(seg.key);
             }
             return;
         }
@@ -3715,6 +3927,10 @@
         if (seg.pendingFinishAfterDrain) {
             if (titleAhead || playbackHasSpeech(seg)) {
                 maybeSkipBlankToNextTransmission(seg);
+                return;
+            }
+            // Pas actif (préempté / en file) : attendre la promotion pour vider le tampon.
+            if (!isActive && segmentHasRingContent(seg)) {
                 return;
             }
             if (waiting <= 0.3 && !titleAhead && liveBlank) {
@@ -3950,6 +4166,7 @@
         }
         if (exclusiveActive) {
             exclusiveActive.manualPriority = false;
+            clearBlankHoldForSpeech(exclusiveActive);
             exclusiveQueue.unshift(exclusiveActive);
             stopExclusivePlay(exclusiveActive, { keepBuffer: true });
         }
@@ -4031,6 +4248,8 @@
         if (exclusiveActive) {
             const displaced = exclusiveActive;
             displaced.manualPriority = false;
+            // Annuler le hold 7 s : la carte reprendra après la prio avec son tampon.
+            clearBlankHoldForSpeech(displaced);
             exclusiveQueue = exclusiveQueue.filter((s) => s.key !== displaced.key);
             exclusiveQueue.unshift(displaced);
             stopExclusivePlay(displaced, { keepBuffer: true });
@@ -4126,10 +4345,8 @@
 
     function startExclusivePlay(seg) {
         stopExclusivePlay(seg, { keepBuffer: true, keepIngest: true });
-        if (!mseMpegSupported()) {
-            startExclusivePlayHtml(seg);
-            return;
-        }
+        // Queue MSE uniquement (Chrome). Firefox : l'option est masquée, pas de fallback HTML.
+        if (!mseMpegSupported()) return;
         // Mode exclusif = pipeline ring buffer MSE (Chrome/Chromium).
         if (!getRingBufferKit()) {
             if (seg.card) {
@@ -4334,11 +4551,14 @@
         const abActive = abState.active_group_id ? String(abState.active_group_id) : '';
         const tpActive = tpState.active_group_id ? String(tpState.active_group_id) : '';
         const arb = pulseArbiterState;
-        const arbActive = arb && arb.active ? arb.active : null;
+        // File unifiée : un seul actif (arbitre). Ne pas OR les is_active locaux
+        // Airband + Tetrapol, sinon deux boutons s'allument en même temps.
+        const arbEnabled = !!(arb && arb.enabled !== false && exclusive);
+        const arbActive = arbEnabled && arb.active ? arb.active : null;
         const displayActiveId = arbActive ? String(arbActive.id)
-            : (abActive || tpActive || '');
+            : (arbEnabled ? '' : (abActive || tpActive || ''));
         const displayActiveSource = arbActive ? arbActive.source
-            : (abActive ? 'airband' : (tpActive ? 'tetrapol' : ''));
+            : (arbEnabled ? '' : (abActive ? 'airband' : (tpActive ? 'tetrapol' : '')));
         const manualHold = !!(abState.manual_hold || tpState.manual_hold);
 
         const abListen = new Map((abState.listen_groups || []).map(g => [String(g.group_id), g]));
@@ -4357,7 +4577,7 @@
                 source: 'airband',
                 rawId: gid,
                 label: pulseGroupLabel(gid),
-                on_air: !!g.on_air,
+                on_air: pulseGroupOnAir('airband', gid, null, g),
                 meta: { has_pulse: true, listen: true },
                 has_stream: false,
                 streamUrl: null
@@ -4371,7 +4591,7 @@
                 source: 'tetrapol',
                 rawId: gid,
                 label: pulseGroupLabel(gid),
-                on_air: !!g.on_air,
+                on_air: pulseGroupOnAir('tetrapol', gid, null, g),
                 encrypted: false,
                 meta: { listen: true, encrypted: false },
                 has_stream: true,
@@ -4395,13 +4615,16 @@
                 const pe = e.source === 'tetrapol'
                     ? (tpListen.get(String(e.rawId)) || {})
                     : (abListen.get(String(e.rawId)) || {});
+                const onAir = pulseGroupOnAir(e.source, e.rawId, e, pe);
+                const isAct = exclusive && pulseGroupIsPlaying(
+                    e.source, e.rawId, displayActiveId, displayActiveSource);
                 return [
                     e.key,
                     (e.meta && e.meta.listen !== false) ? 1 : 0,
-                    e.on_air ? 1 : 0,
+                    onAir ? 1 : 0,
                     isPulsePriority(e.key) ? 1 : 0,
                     pe.suspended ? 1 : 0,
-                    pe.is_active ? 1 : 0
+                    isAct ? 1 : 0
                 ];
             })
         });
@@ -4510,10 +4733,10 @@
                     labelEl.textContent = prefix + labelOf(entry);
                 }
                 btn.classList.toggle('enabled', !!listening);
-                btn.classList.toggle('on-air', !!entry.on_air);
+                btn.classList.toggle('on-air', pulseGroupOnAir(entry.source, gid, entry, pe));
                 btn.classList.toggle('priority', !!prio);
-                const isAct = !!(pe.is_active
-                    || (displayActiveSource === entry.source && displayActiveId === gid));
+                const isAct = exclusive && pulseGroupIsPlaying(
+                    entry.source, gid, displayActiveId, displayActiveSource);
                 btn.classList.toggle('pulse-active', isAct);
                 const fillInner = btn.querySelector('.pulse-btn-fill-inner');
                 if (fillInner && fillInner.parentElement) {
@@ -4589,9 +4812,15 @@
         const abQueue = Array.isArray(abState.queue_order) ? abState.queue_order.map(String) : [];
         const tpQueue = Array.isArray(tpState.queue_order) ? tpState.queue_order.map(String) : [];
         const arb = pulseArbiterState;
-        const arbActive = arb && arb.active ? arb.active : null;
+        const exclusive = !!(abState.exclusive || tpState.exclusive);
+        const arbEnabled = !!(arb && arb.enabled !== false && exclusive);
+        const arbActive = arbEnabled && arb.active ? arb.active : null;
         const abActive = abState.active_group_id ? String(abState.active_group_id) : '';
         const tpActive = tpState.active_group_id ? String(tpState.active_group_id) : '';
+        const displayActiveId = arbActive ? String(arbActive.id)
+            : (arbEnabled ? '' : (abActive || tpActive || ''));
+        const displayActiveSource = arbActive ? arbActive.source
+            : (arbEnabled ? '' : (abActive ? 'airband' : (tpActive ? 'tetrapol' : '')));
 
         const rows = [];
         const seen = new Set();
@@ -4601,9 +4830,7 @@
             const gid = String(entry.rawId);
             seen.add('airband:' + gid);
             const tel = abTel[gid] || {};
-            const isAct = !!(tel.is_active
-                || (arbActive && arbActive.source === 'airband' && String(arbActive.id) === gid)
-                || (!arbActive && gid === abActive));
+            const isAct = pulseGroupIsPlaying('airband', gid, displayActiveId, displayActiveSource);
             rows.push({
                 group_id: gid,
                 priority: !!(tel.priority || isPulsePriority(airKey(gid))),
@@ -4613,7 +4840,7 @@
                 buffer_seconds: Number(tel.buffer_seconds) || 0,
                 in_queue: !!(tel.in_queue || abQueue.includes(gid)
                     || (arb && arb.queue && arb.queue.some(s => s.source === 'airband' && String(s.id) === gid))),
-                on_air: !!(tel.on_air || entry.on_air),
+                on_air: pulseGroupOnAir('airband', gid, entry, tel),
                 source: 'airband'
             });
         });
@@ -4623,13 +4850,12 @@
             rows.push({
                 group_id: gid,
                 priority: !!tel.priority,
-                is_active: !!(tel.is_active || (!arbActive && gid === abActive)
-                    || (arbActive && arbActive.source === 'airband' && String(arbActive.id) === gid)),
+                is_active: pulseGroupIsPlaying('airband', gid, displayActiveId, displayActiveSource),
                 suspended: !!tel.suspended,
                 fill_ratio: Number(tel.fill_ratio) || 0,
                 buffer_seconds: Number(tel.buffer_seconds) || 0,
                 in_queue: !!(tel.in_queue || abQueue.includes(gid)),
-                on_air: !!tel.on_air,
+                on_air: pulseGroupOnAir('airband', gid, null, tel),
                 source: 'airband'
             });
         });
@@ -4639,9 +4865,7 @@
             const gid = String(entry.rawId);
             seen.add('tetrapol:' + gid);
             const tel = tpTel[gid] || {};
-            const isAct = !!(tel.is_active
-                || (arbActive && arbActive.source === 'tetrapol' && String(arbActive.id) === gid)
-                || (!arbActive && gid === tpActive));
+            const isAct = pulseGroupIsPlaying('tetrapol', gid, displayActiveId, displayActiveSource);
             rows.push({
                 group_id: gid,
                 priority: !!(tel.priority || isPulsePriority(tpKey(gid))),
@@ -4651,7 +4875,7 @@
                 buffer_seconds: Number(tel.buffer_seconds) || 0,
                 in_queue: !!(tel.in_queue || tpQueue.includes(gid)
                     || (arb && arb.queue && arb.queue.some(s => s.source === 'tetrapol' && String(s.id) === gid))),
-                on_air: !!(tel.on_air || entry.on_air),
+                on_air: pulseGroupOnAir('tetrapol', gid, entry, tel),
                 source: 'tetrapol'
             });
         });
@@ -4661,13 +4885,12 @@
             rows.push({
                 group_id: gid,
                 priority: !!tel.priority,
-                is_active: !!(tel.is_active || (!arbActive && gid === tpActive)
-                    || (arbActive && arbActive.source === 'tetrapol' && String(arbActive.id) === gid)),
+                is_active: pulseGroupIsPlaying('tetrapol', gid, displayActiveId, displayActiveSource),
                 suspended: !!tel.suspended,
                 fill_ratio: Number(tel.fill_ratio) || 0,
                 buffer_seconds: Number(tel.buffer_seconds) || 0,
                 in_queue: !!(tel.in_queue || tpQueue.includes(gid)),
-                on_air: !!tel.on_air,
+                on_air: pulseGroupOnAir('tetrapol', gid, null, tel),
                 source: 'tetrapol'
             });
         });
@@ -5476,6 +5699,7 @@
             updateAirbandButtons();
             updateReceptionDisplay();
             syncPlayersFromCatalog();
+            lastPulseSig = '';
         }
         if (msg.NETWORKS) {
             applyNetworksPayload(msg.NETWORKS);
@@ -5483,14 +5707,13 @@
         }
         updateScopeButtons();
         if (pulseChanged) {
-            // Fill-only: update pulse state/bars — no catalog/button rebuild.
             applyPulseExclusiveFromMsg(msg);
             if (listingChanged) refreshExclusiveSegmentEntries();
-            updatePulseAdmin();
-        } else if (msg.sources || msg.config) {
-            refreshMonitorConnectionStatus();
         }
-        if (listingChanged || pulseChanged) {
+        if (pulseChanged || listingChanged) {
+            updatePulseAdmin();
+            refreshMonitorConnectionStatus();
+        } else if (msg.sources || msg.config) {
             refreshMonitorConnectionStatus();
         }
     }
@@ -5567,7 +5790,11 @@
                 syncPlayersFromCatalog();
             });
         }
-        if (el.exclusiveToggle) {
+        if (!mseMpegSupported()) {
+            exclusivePlaybackMode = false;
+            if (el.exclusivePlaybackControl) el.exclusivePlaybackControl.style.display = 'none';
+            if (el.exclusiveForceControl) el.exclusiveForceControl.style.display = 'none';
+        } else if (el.exclusiveToggle) {
             el.exclusiveToggle.checked = exclusivePlaybackMode;
             if (el.exclusiveForceControl) el.exclusiveForceControl.style.display = exclusivePlaybackMode ? '' : 'none';
             el.exclusiveToggle.addEventListener('change', () => {
