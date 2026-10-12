@@ -13,7 +13,7 @@ const DEFAULT_CONFIG = {
     /** Full snapshot resync to clients (patches in between). Keep below UI CELL_INFO_TIMEOUT_MS. */
     fullSyncIntervalMs: 15000,
     /** Mark Airband/Tetrapol dead if no WS update arrives within this window. */
-    sourceStaleMs: 30000,
+    sourceStaleMs: 8000,
     pulseArbiter: true,
 };
 
@@ -399,11 +399,14 @@ class WsBridge {
         ws.on('open', () => {
             src.connected = true;
             src.retries = 0;
-            src.lastMsgAt = Date.now();
+            // Do not refresh lastMsgAt here — only real messages prove liveness.
+            // Half-open reconnects used to reset the stale clock and block failover.
+            if (!src.lastMsgAt) src.lastMsgAt = Date.now();
             if (name === 'tetrapol') {
                 this.state.tetrapol.connected = true;
             }
             this.dirty = true;
+            this.tickArbiter();
             this.flushBroadcast();
         });
         ws.on('message', (data) => {
@@ -592,7 +595,8 @@ class WsBridge {
         if (!next) return;
         this._mirroringPulseMode = true;
         this.arbiter.post(next.target, next.body)
-            .then(() => {
+            .then((res) => {
+                if (res == null) return;
                 this._pulseModeSeen[next.target] = next.key;
             })
             .catch((err) => {

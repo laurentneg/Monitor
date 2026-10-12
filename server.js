@@ -110,7 +110,21 @@ app.post('/api/pulse/stop', async (req, res) => {
         return;
     }
     try {
-        const result = await bridge.arbiter.stopActive();
+        const result = await bridge.arbiter.disableActive();
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });
+    }
+});
+
+app.post('/api/pulse/pause', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!bridge || !bridge.arbiter) {
+        res.status(503).json({ ok: false, note: 'arbiter_disabled' });
+        return;
+    }
+    try {
+        const result = await bridge.arbiter.pauseActive();
         res.json(result);
     } catch (err) {
         res.status(500).json({ ok: false, error: String(err && err.message ? err.message : err) });

@@ -127,6 +127,8 @@
     let pulsePanelDelegated = false;
     let pulseControlInFlight = false;
     let pulseLocalEditUntil = 0;
+    let lastPulseActionAt = 0;
+    let lastPulseActionKey = '';
     let departmentsMap = {};
     let countriesMap = {};
     let globalVolume = parseInt(localStorage.getItem('globalVolume') || '50', 10);
@@ -802,6 +804,27 @@
             });
         } catch (e) {
             console.warn('tetrapol toggle', e);
+        }
+    }
+
+    function applyLocalPulseListen(source, gid, listen) {
+        const id = String(gid || '');
+        if (source === 'tetrapol') {
+            const g = tetrapolGroups.get(id);
+            if (g) g.listen = !!listen;
+            const entry = catalog.get(tpKey(id));
+            if (entry) {
+                if (!entry.meta) entry.meta = {};
+                entry.meta.listen = !!listen;
+            }
+        } else {
+            const ch = getAirbandChannel(id);
+            if (ch) ch.listen = !!listen;
+            const entry = catalog.get(airKey(id));
+            if (entry) {
+                if (!entry.meta) entry.meta = {};
+                entry.meta.listen = !!listen;
+            }
         }
     }
 
@@ -2355,14 +2378,18 @@
     }
 
     function getBlankAgeMs(key, seg) {
+        // Rattrapage : l'âge du blanc live ne doit pas fermer la carte.
+        if (seg && getRingWaitingSeconds(seg) > 0.5 && !isPlaybackInBlank(seg)) {
+            return 0;
+        }
         if (seg?.ringBuffer && typeof seg.ringBuffer.effectiveBlankSecAt === 'function') {
             const rb = seg.ringBuffer;
             const bytePos = getPlaybackBytePos(seg);
             const inBlank = typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos);
-            const nearLiveBlank = getRingWaitingSeconds(seg) <= 0.5 && liveEdgeIsBlank(seg);
-            if (inBlank || nearLiveBlank || rb.inBlank) {
-                const pos = inBlank ? bytePos : Math.max(bytePos, rb.totalBytesWritten - 1);
-                const fromRing = Math.round(rb.effectiveBlankSecAt(pos) * 1000);
+            // Ne compter que si la lecture est dans le blanc — pas le silence live
+            // pendant qu'on rattrape encore de la parole.
+            if (inBlank) {
+                const fromRing = Math.round(rb.effectiveBlankSecAt(bytePos) * 1000);
                 if (fromRing > 0) return fromRing;
                 if (rb.inBlank && rb.blankStartedAtMs) {
                     return Math.max(0, Math.round(performance.now() - rb.blankStartedAtMs));
@@ -2679,6 +2706,11 @@
             if (holdSeg && playbackHasSpeech(holdSeg)) return;
             if (holdSeg && ringHasLiveTalk(holdSeg)) return;
         }
+        // Rattrapage : vider le tampon d'abord, hold 7 s ensuite.
+        if (holdSeg && getRingWaitingSeconds(holdSeg) > 0.5 && !isPlaybackInBlank(holdSeg)) {
+            holdSeg.pendingFinishAfterDrain = true;
+            return;
+        }
 
         const seg = holdSeg;
         if (blankSince[key] == null) {
@@ -2713,6 +2745,11 @@
                 return;
             }
             if (ingestIsReconnecting(liveSeg)) return;
+            // Rattrapage encore à lire.
+            if (liveSeg && getRingWaitingSeconds(liveSeg) > 0.5 && !isPlaybackInBlank(liveSeg)) {
+                liveSeg.pendingFinishAfterDrain = true;
+                return;
+            }
             if (!liveSeg || liveEdgeIsBlank(liveSeg)) stopEntryAfterBlank(key);
             return;
         }
@@ -3345,13 +3382,8 @@
         const bytePos = typeof bp.playbackByteOffset === 'function'
             ? bp.playbackByteOffset()
             : rb.readByteOffset;
-        // Toujours le titre à la tête de lecture — pas l'état live (grâce / inBlank),
-        // sinon le label disparaît alors que l'audio de la com est encore joué.
+        // Tête dans le blanc → pas de label (ne pas coller lastTitle / ancien talker).
         if (typeof rb.isBlankAtByte === 'function' && rb.isBlankAtByte(bytePos)) {
-            // Tête dans le blanc, mais une reprise live a déjà un label.
-            if (!rb.inBlank && String(rb.lastTitle || '').trim()) {
-                return String(rb.lastTitle).trim();
-            }
             return '';
         }
         if (typeof rb.displayTitleAtByte === 'function') {
@@ -3364,11 +3396,9 @@
                 return String(titleAtPos).trim();
             }
         }
-        // Lecture encore avant le 1er marqueur : afficher le live / dernier titre connu.
-        return (String(rb.lastTitle || '').trim()
-            || seg.ringLastTitle
-            || lastStreamTitles[seg.key]
-            || '').trim();
+        // Grâce fin de com : audio encore sous l'ancien StreamTitle.
+        if (rb.blankGraceActive) return String(rb.lastTitle || '').trim();
+        return '';
     }
 
     function syncRingBufferTitleDisplay(seg) {
@@ -3852,16 +3882,20 @@
             }
             return false;
         }
+        // Rattrapage en cours : ne pas lancer / avancer le hold 7 s.
+        const waiting = getRingWaitingSeconds(seg);
+        if (waiting > 0.5 && !isPlaybackInBlank(seg)) {
+            seg._uiBlankSinceMs = null;
+            return false;
+        }
         if (!hasBlank) {
             // Grâce / flicker ICY : ne pas annuler un décompte déjà lancé.
             if (!playingBlank) seg._uiBlankSinceMs = null;
             return false;
         }
 
-        const waiting = getRingWaitingSeconds(seg);
         const inBlankPlay = isPlaybackInBlank(seg)
-            || liveEdgeIsBlank(seg)
-            || (waiting <= 0.5 && hasBlank);
+            || (waiting <= 0.5 && hasBlank && liveEdgeIsBlank(seg));
         if (!inBlankPlay) {
             seg._uiBlankSinceMs = null;
             return false;
@@ -3939,8 +3973,8 @@
             return;
         }
 
-        // Encore du rattrapage de parole (pas un blanc live) : ne pas fermer.
-        if (waiting > 0.5 && !inPlaybackBlank && !liveBlank) {
+        // Encore du rattrapage : ne pas fermer, même si le live est déjà blanc.
+        if (waiting > 0.5 && !inPlaybackBlank) {
             seg._nearLiveBlankSinceMs = null;
             return;
         }
@@ -4548,6 +4582,7 @@
         const tpState = tpPulseExclusiveState || {};
         const exclusive = !!(abState.exclusive || tpState.exclusive);
         const forceOn = !!(abState.force_before_full || tpState.force_before_full);
+        const catchupFast = !!(abState.catchup_fast || tpState.catchup_fast);
         const abActive = abState.active_group_id ? String(abState.active_group_id) : '';
         const tpActive = tpState.active_group_id ? String(tpState.active_group_id) : '';
         const arb = pulseArbiterState;
@@ -4559,7 +4594,11 @@
             : (arbEnabled ? '' : (abActive || tpActive || ''));
         const displayActiveSource = arbActive ? arbActive.source
             : (arbEnabled ? '' : (abActive ? 'airband' : (tpActive ? 'tetrapol' : '')));
-        const manualHold = !!(abState.manual_hold || tpState.manual_hold);
+        // Avec l'arbitre : seul le Stop utilisateur compte (pas le manual_hold
+        // technique posé à chaque yield/activate).
+        const manualHold = arbEnabled
+            ? !!arb.user_hold
+            : !!(abState.manual_hold || tpState.manual_hold);
 
         const abListen = new Map((abState.listen_groups || []).map(g => [String(g.group_id), g]));
         const tpListen = new Map((tpState.listen_groups || []).map(g => [String(g.group_id), g]));
@@ -4605,11 +4644,16 @@
             as: displayActiveSource,
             m: manualHold,
             f: forceOn,
+            c: catchupFast,
+            arbA: arbActive ? `${arbActive.source}:${arbActive.id}` : '',
+            g: pulseEntries.map(e => [
+                e.key,
+                (e.meta && e.meta.listen !== false) ? 1 : 0
+            ])
+        });
+        const fillSig = JSON.stringify({
             qAb: abState.queue_order || [],
             qTp: tpState.queue_order || [],
-            pAb: [...(abState.priority_groups || [])].map(String).sort(),
-            pTp: [...(tpState.priority_groups || [])].map(String).sort(),
-            arbA: arbActive ? `${arbActive.source}:${arbActive.id}` : '',
             arbQ: arb && arb.queue ? arb.queue.map((s) => `${s.source}:${s.id}`).join(',') : '',
             g: pulseEntries.map(e => {
                 const pe = e.source === 'tetrapol'
@@ -4620,25 +4664,17 @@
                     e.source, e.rawId, displayActiveId, displayActiveSource);
                 return [
                     e.key,
-                    (e.meta && e.meta.listen !== false) ? 1 : 0,
+                    Math.floor((Number(pe.fill_ratio) || 0) * 100),
+                    Math.floor((Number(pe.buffer_seconds) || 0) * 2),
                     onAir ? 1 : 0,
-                    isPulsePriority(e.key) ? 1 : 0,
+                    isAct ? 1 : 0,
+                    (isPulsePriority(e.key) || pe.priority) ? 1 : 0,
                     pe.suspended ? 1 : 0,
-                    isAct ? 1 : 0
+                    pe.in_queue ? 1 : 0,
+                    e.source === 'tetrapol' ? pulseRfsiForGroup(e.rawId) : ''
                 ];
             })
         });
-        const fillSig = JSON.stringify(pulseEntries.map(e => {
-            const pe = e.source === 'tetrapol'
-                ? (tpListen.get(String(e.rawId)) || {})
-                : (abListen.get(String(e.rawId)) || {});
-            // 1% / 0.5 s floor buckets — match ws-bridge quantization
-            return [
-                e.key,
-                Math.floor((Number(pe.fill_ratio) || 0) * 100),
-                Math.floor((Number(pe.buffer_seconds) || 0) * 2)
-            ];
-        }));
         const needStruct = structSig !== lastPulseSig;
         const needFills = fillSig !== lastPulseFillSig;
         if (!needStruct && !needFills) return;
@@ -4650,6 +4686,7 @@
         const toggle = document.getElementById('pulseExclusivePlaybackToggle');
         const force = document.getElementById('pulseExclusiveForceBufferToggle');
         const forceCtl = document.getElementById('pulseExclusiveForceBufferControl');
+        const catchup = document.getElementById('pulseCatchupFastToggle');
         const btnBox = document.getElementById('pulseAudioButtonsContainer');
         const statusPanel = document.getElementById('pulseExclusiveStatusPanel');
         const summary = document.getElementById('pulseExclusiveStatusSummary');
@@ -4658,10 +4695,12 @@
         if (toggle && document.activeElement !== toggle) toggle.checked = exclusive;
         if (forceCtl) forceCtl.style.display = exclusive ? '' : 'none';
         if (force && document.activeElement !== force) force.checked = forceOn;
+        if (catchup && document.activeElement !== catchup) catchup.checked = catchupFast;
 
         const uiState = {
             exclusive,
             force_before_full: forceOn,
+            catchup_fast: catchupFast,
             manual_hold: manualHold,
             active_group_id: displayActiveId,
             active_source: displayActiveSource,
@@ -4744,10 +4783,12 @@
                     fillInner.style.width = pct + '%';
                     fillInner.parentElement.style.display = '';
                 }
-                btn.title = prio
+                btn.title = isAct
+                    ? ('En lecture Pulse · ' + gid)
+                    : (prio
                     ? 'Priorité Pulse — clic droit / appui long pour retirer'
                     : ((entry.source === 'tetrapol' ? 'Pulse Tetrapol · ' : 'Pulse Analogique · ')
-                        + gid + (listening ? ' · ON' : ' · OFF'));
+                        + gid + (listening ? ' · ON' : ' · OFF')));
             });
         } else if (btnBox && needFills) {
             pulseEntries.forEach((entry) => {
@@ -4756,6 +4797,13 @@
                     : (abListen.get(String(entry.rawId)) || {});
                 const btn = btnBox.querySelector('.pulse-btn[data-key="' + esc(entry.key) + '"]');
                 if (!btn) return;
+                const onAir = pulseGroupOnAir(entry.source, entry.rawId, entry, pe);
+                const prio = isPulsePriority(entry.key) || !!(pe.priority);
+                const isAct = exclusive && pulseGroupIsPlaying(
+                    entry.source, entry.rawId, displayActiveId, displayActiveSource);
+                btn.classList.toggle('on-air', onAir);
+                btn.classList.toggle('priority', !!prio);
+                btn.classList.toggle('pulse-active', isAct);
                 const fillInner = btn.querySelector('.pulse-btn-fill-inner');
                 if (fillInner && fillInner.parentElement) {
                     const pct = Math.max(0, Math.min(100, Math.round((pe.fill_ratio || 0) * 100)));
@@ -4765,7 +4813,7 @@
             });
         }
         if (statusPanel && summary && list) {
-            renderPulseExclusiveStatusPanel(uiState, statusPanel, summary, list, needStruct);
+            renderPulseExclusiveStatusPanel(uiState, statusPanel, summary, list);
         }
     }
 
@@ -4902,114 +4950,180 @@
         return rows;
     }
 
+    function pulseActionButtonFromEvent(e, panel) {
+        const btn = e.target && e.target.closest ? e.target.closest('[data-pulse-action]') : null;
+        if (!btn || !panel.contains(btn)) return null;
+        return btn;
+    }
+
+    async function handlePulsePanelAction(btn) {
+        const action = btn.getAttribute('data-pulse-action');
+        let gid = btn.getAttribute('data-group-id') || '';
+        let src = btn.getAttribute('data-source') || resolvePulseSource(gid);
+        const dedupeKey = action + ':' + src + ':' + gid;
+        const now = Date.now();
+        if (dedupeKey === lastPulseActionKey && now - lastPulseActionAt < 400) return;
+        lastPulseActionKey = dedupeKey;
+        lastPulseActionAt = now;
+        if (pulseControlInFlight) return;
+        lastPulseSig = '';
+        lastPulseFillSig = '';
+        pulseLocalEditUntil = Date.now() + 2000;
+        pulseControlInFlight = true;
+
+        try {
+        const prevAb = pulseExclusiveState && typeof pulseExclusiveState === 'object'
+            ? pulseExclusiveState : {};
+        const prevTp = tpPulseExclusiveState && typeof tpPulseExclusiveState === 'object'
+            ? tpPulseExclusiveState : {};
+        if (action === 'stop') {
+            let stopGid = gid;
+            let stopSrc = src;
+            if (!stopGid && pulseArbiterState && pulseArbiterState.active) {
+                stopGid = String(pulseArbiterState.active.id);
+                stopSrc = pulseArbiterState.active.source;
+            }
+            if (!stopGid) {
+                stopGid = String(prevAb.active_group_id || prevTp.active_group_id || '');
+                stopSrc = resolvePulseSource(stopGid);
+            }
+            if (stopGid) {
+                applyLocalPulseListen(stopSrc, stopGid, false);
+                gid = stopGid;
+                src = stopSrc;
+            }
+            pulseExclusiveState = { ...prevAb, active_group_id: '' };
+            tpPulseExclusiveState = { ...prevTp, active_group_id: '' };
+            updatePulseAdmin();
+        } else if (action === 'pause') {
+            pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: true };
+            tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: true };
+            updatePulseAdmin();
+        } else if (action === 'auto') {
+            pulseExclusiveState = { ...prevAb, manual_hold: false };
+            tpPulseExclusiveState = { ...prevTp, manual_hold: false };
+            updatePulseAdmin();
+        } else if (action === 'play' && gid) {
+            if (src === 'tetrapol') {
+                tpPulseExclusiveState = { ...prevTp, active_group_id: gid, manual_hold: false };
+                pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: false };
+            } else {
+                pulseExclusiveState = { ...prevAb, active_group_id: gid, manual_hold: false };
+                tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: false };
+            }
+            if (pulseArbiterState && typeof pulseArbiterState === 'object') {
+                pulseArbiterState = { ...pulseArbiterState, user_hold: false };
+            }
+            updatePulseAdmin();
+        } else if (action === 'clear' && gid) {
+            const clearListen = (prev) => {
+                const listen = Array.isArray(prev.listen_groups)
+                    ? prev.listen_groups.map((g) => {
+                        if (String(g.group_id) !== String(gid)) return g;
+                        return { ...g, fill_ratio: 0, buffer_seconds: 0 };
+                    })
+                    : prev.listen_groups;
+                const fills = { ...(prev.fill_ratios || {}) };
+                fills[gid] = 0;
+                return { ...prev, listen_groups: listen, fill_ratios: fills };
+            };
+            if (src === 'tetrapol') tpPulseExclusiveState = clearListen(prevTp);
+            else pulseExclusiveState = clearListen(prevAb);
+            updatePulseAdmin();
+        }
+
+            const arbOn = !!(pulseArbiterState && pulseArbiterState.enabled !== false
+                && (pulseExclusiveState.exclusive || tpPulseExclusiveState.exclusive));
+            let result = null;
+            if (arbOn) {
+                if (action === 'stop') {
+                    if (gid) {
+                        if (src === 'tetrapol') await apiTetrapolToggle(gid, false);
+                        else await apiPulseToggle(gid, false);
+                    }
+                    result = await apiPulseArbiter('stop');
+                } else if (action === 'pause') {
+                    result = await apiPulseArbiter('pause');
+                } else if (action === 'auto') {
+                    result = await apiPulseArbiter('auto');
+                } else if (action === 'play' && gid) {
+                    result = await apiPulseArbiter('play', { source: src, id: gid });
+                } else if (action === 'clear' && gid) {
+                    result = await apiPulseArbiter('clear', { source: src, id: gid });
+                }
+                if (result && result.arbiter) pulseArbiterState = result.arbiter;
+            } else if (src === 'tetrapol') {
+                if (action === 'stop') {
+                    if (gid) await apiTetrapolToggle(gid, false);
+                    result = await apiTetrapolPulseExclusive({
+                        yield_active: true, active_group_id: ''
+                    });
+                } else if (action === 'pause') {
+                    result = await apiTetrapolPulseExclusive({
+                        yield_active: true, active_group_id: '', manual_hold: true
+                    });
+                } else if (action === 'auto') {
+                    result = await apiTetrapolPulseExclusive({ manual_hold: false });
+                } else if (action === 'play' && gid) {
+                    result = await apiTetrapolPulseExclusive({
+                        active_group_id: gid, manual_hold: false
+                    });
+                } else if (action === 'clear' && gid) {
+                    result = await apiTetrapolPulseExclusive({ clear_buffer: gid });
+                }
+                if (result) tpPulseExclusiveState = { ...tpPulseExclusiveState, ...result };
+            } else {
+                if (action === 'stop') {
+                    if (gid) await apiPulseToggle(gid, false);
+                    result = await apiPulseExclusive({ stop_active: true });
+                } else if (action === 'pause') {
+                    result = await apiPulseExclusive({ stop_active: true, manual_hold: true });
+                } else if (action === 'auto') {
+                    result = await apiPulseExclusive({ manual_hold: false });
+                } else if (action === 'play' && gid) {
+                    result = await apiPulseExclusive({
+                        active_group_id: gid, manual_hold: false
+                    });
+                } else if (action === 'clear' && gid) {
+                    result = await apiPulseExclusive({ clear_buffer: gid });
+                }
+                if (result) pulseExclusiveState = { ...pulseExclusiveState, ...result };
+            }
+            pulseLocalEditUntil = Date.now() + 1500;
+            updatePulseAdmin();
+        } finally {
+            pulseControlInFlight = false;
+        }
+    }
+
     function ensurePulseExclusivePanelDelegation(panel) {
         if (!panel || pulsePanelDelegated) return;
         pulsePanelDelegated = true;
-        panel.addEventListener('click', async (e) => {
-            const btn = e.target && e.target.closest ? e.target.closest('[data-pulse-action]') : null;
-            if (!btn || !panel.contains(btn)) return;
+        // pointerdown : l'action part tout de suite, avant qu'un refresh télémétrie
+        // ne remplace le bouton et n'annule le click (mousedown + mouseup).
+        // Le click suivant est ignoré : après Play le DOM peut remplacer le bouton
+        // par Pause sous le curseur, et le click retomberait sur Pause.
+        let pulsePointerHandledAt = 0;
+        panel.addEventListener('pointerdown', (e) => {
+            if (e.pointerType === 'mouse' && e.button !== 0) return;
+            const btn = pulseActionButtonFromEvent(e, panel);
+            if (!btn) return;
             e.preventDefault();
             e.stopPropagation();
-            if (pulseControlInFlight) return;
-            const action = btn.getAttribute('data-pulse-action');
-            const gid = btn.getAttribute('data-group-id') || '';
-            const src = btn.getAttribute('data-source') || resolvePulseSource(gid);
-            lastPulseSig = '';
-            lastPulseFillSig = '';
-            pulseLocalEditUntil = Date.now() + 2000;
-            pulseControlInFlight = true;
-
-            const prevAb = pulseExclusiveState && typeof pulseExclusiveState === 'object'
-                ? pulseExclusiveState : {};
-            const prevTp = tpPulseExclusiveState && typeof tpPulseExclusiveState === 'object'
-                ? tpPulseExclusiveState : {};
-            if (action === 'stop') {
-                pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: true };
-                tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: true };
-                updatePulseAdmin();
-            } else if (action === 'auto') {
-                pulseExclusiveState = { ...prevAb, manual_hold: false };
-                tpPulseExclusiveState = { ...prevTp, manual_hold: false };
-                updatePulseAdmin();
-            } else if (action === 'play' && gid) {
-                if (src === 'tetrapol') {
-                    tpPulseExclusiveState = { ...prevTp, active_group_id: gid, manual_hold: true };
-                    pulseExclusiveState = { ...prevAb, active_group_id: '', manual_hold: true };
-                } else {
-                    pulseExclusiveState = { ...prevAb, active_group_id: gid, manual_hold: true };
-                    tpPulseExclusiveState = { ...prevTp, active_group_id: '', manual_hold: true };
-                }
-                updatePulseAdmin();
-            } else if (action === 'clear' && gid) {
-                const clearListen = (prev) => {
-                    const listen = Array.isArray(prev.listen_groups)
-                        ? prev.listen_groups.map((g) => {
-                            if (String(g.group_id) !== String(gid)) return g;
-                            return { ...g, fill_ratio: 0, buffer_seconds: 0 };
-                        })
-                        : prev.listen_groups;
-                    const fills = { ...(prev.fill_ratios || {}) };
-                    fills[gid] = 0;
-                    return { ...prev, listen_groups: listen, fill_ratios: fills };
-                };
-                if (src === 'tetrapol') tpPulseExclusiveState = clearListen(prevTp);
-                else pulseExclusiveState = clearListen(prevAb);
-                updatePulseAdmin();
-            }
-
-            try {
-                const arbOn = !!(pulseArbiterState && pulseArbiterState.enabled !== false
-                    && (pulseExclusiveState.exclusive || tpPulseExclusiveState.exclusive));
-                let result = null;
-                if (arbOn) {
-                    if (action === 'stop') {
-                        result = await apiPulseArbiter('stop');
-                    } else if (action === 'auto') {
-                        result = await apiPulseArbiter('auto');
-                    } else if (action === 'play' && gid) {
-                        result = await apiPulseArbiter('play', { source: src, id: gid });
-                    } else if (action === 'clear' && gid) {
-                        result = await apiPulseArbiter('clear', { source: src, id: gid });
-                    }
-                    if (result && result.arbiter) pulseArbiterState = result.arbiter;
-                } else if (src === 'tetrapol') {
-                    if (action === 'stop') {
-                        result = await apiTetrapolPulseExclusive({
-                            yield_active: true, active_group_id: '', manual_hold: true
-                        });
-                    } else if (action === 'auto') {
-                        result = await apiTetrapolPulseExclusive({ manual_hold: false });
-                    } else if (action === 'play' && gid) {
-                        result = await apiTetrapolPulseExclusive({
-                            active_group_id: gid, manual_hold: true
-                        });
-                    } else if (action === 'clear' && gid) {
-                        result = await apiTetrapolPulseExclusive({ clear_buffer: gid });
-                    }
-                    if (result) tpPulseExclusiveState = { ...tpPulseExclusiveState, ...result };
-                } else {
-                    if (action === 'stop') {
-                        result = await apiPulseExclusive({ stop_active: true, manual_hold: true });
-                    } else if (action === 'auto') {
-                        result = await apiPulseExclusive({ manual_hold: false });
-                    } else if (action === 'play' && gid) {
-                        result = await apiPulseExclusive({
-                            active_group_id: gid, manual_hold: true
-                        });
-                    } else if (action === 'clear' && gid) {
-                        result = await apiPulseExclusive({ clear_buffer: gid });
-                    }
-                    if (result) pulseExclusiveState = { ...pulseExclusiveState, ...result };
-                }
-                pulseLocalEditUntil = Date.now() + 1500;
-                updatePulseAdmin();
-            } finally {
-                pulseControlInFlight = false;
-            }
+            pulsePointerHandledAt = Date.now();
+            handlePulsePanelAction(btn);
+        });
+        panel.addEventListener('click', (e) => {
+            const btn = pulseActionButtonFromEvent(e, panel);
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            if (Date.now() - pulsePointerHandledAt < 700) return;
+            handlePulsePanelAction(btn);
         });
     }
 
-    function renderPulseExclusiveStatusPanel(state, panel, summaryEl, listEl, rebuildStruct = true) {
+    function renderPulseExclusiveStatusPanel(state, panel, summaryEl, listEl) {
         const exclusive = !!state.exclusive;
         const maxSec = state.buffer_max_seconds || 120;
         const atRiskRatio = 0.80;
@@ -5023,16 +5137,67 @@
         ensurePulseExclusivePanelDelegation(panel);
 
         if (!exclusive) {
-            summaryEl.innerHTML =
-                '<span class="pulse-mode-badge parallel">Mode parallèle</span> '
-                + 'Tous les groupes activés écoutent simultanément sur PulseAudio.';
-            listEl.innerHTML = '';
+            if (summaryEl.dataset.pulseChrome !== 'parallel') {
+                summaryEl.dataset.pulseChrome = 'parallel';
+                summaryEl.innerHTML =
+                    '<span class="pulse-mode-badge parallel">Mode parallèle</span> '
+                    + 'Tous les groupes activés écoutent simultanément sur PulseAudio.';
+            }
+            if (listEl.innerHTML) listEl.innerHTML = '';
             return;
         }
 
         const listenGroups = Array.isArray(state.listen_groups)
             ? state.listen_groups
             : buildStablePulseListenGroups();
+
+        const patchPlaySlot = (playSlot, g, isActive) => {
+            if (!playSlot) return;
+            const gid = String(g.group_id);
+            const src = g.source || 'airband';
+            if (isActive) {
+                if (playSlot.querySelector('.pulse-fill-play-btn')) playSlot.innerHTML = '';
+                if (!playSlot.querySelector('.pulse-fill-active-icon')) {
+                    playSlot.innerHTML = '<span class="pulse-fill-active-icon" title="En lecture" aria-hidden="true">▶</span>';
+                }
+                return;
+            }
+            if (playSlot.querySelector('.pulse-fill-active-icon')) playSlot.innerHTML = '';
+            let playBtn = playSlot.querySelector('.pulse-fill-play-btn');
+            if (!playBtn) {
+                playBtn = document.createElement('button');
+                playBtn.type = 'button';
+                playBtn.className = 'pulse-manual-btn pulse-fill-play-btn';
+                playBtn.title = 'Lancer ce groupe sur PulseAudio maintenant';
+                playBtn.setAttribute('data-pulse-action', 'play');
+                playBtn.textContent = '▶';
+                playSlot.appendChild(playBtn);
+            }
+            playBtn.setAttribute('data-group-id', gid);
+            playBtn.setAttribute('data-source', src);
+        };
+
+        const patchClearBtn = (titleRow, g, show) => {
+            if (!titleRow) return;
+            const gid = String(g.group_id);
+            const src = g.source || 'airband';
+            let clearBtn = titleRow.querySelector('.pulse-fill-clear-btn');
+            if (!show) {
+                if (clearBtn) clearBtn.remove();
+                return;
+            }
+            if (!clearBtn) {
+                clearBtn = document.createElement('button');
+                clearBtn.type = 'button';
+                clearBtn.className = 'pulse-manual-btn pulse-clear-btn pulse-fill-clear-btn';
+                clearBtn.title = 'Vider le tampon et revenir au direct';
+                clearBtn.setAttribute('data-pulse-action', 'clear');
+                clearBtn.textContent = '✕';
+                titleRow.appendChild(clearBtn);
+            }
+            clearBtn.setAttribute('data-group-id', gid);
+            clearBtn.setAttribute('data-source', src);
+        };
 
         const patchRowFill = (row, g) => {
             let fill = Number(g.fill_ratio);
@@ -5046,14 +5211,35 @@
             const atRisk = fill >= atRiskRatio;
             const forceSoon = fill >= forceRatio;
             const gid = String(g.group_id);
-            const isActive = !!(g.is_active || (gid === activeId && (!activeSource || g.source === activeSource)));
+            const src = g.source || 'airband';
+            const isActive = !!(g.is_active || (gid === activeId && (!activeSource || src === activeSource)));
             const onAir = !!g.on_air;
+            const rfsiText = src === 'tetrapol' ? pulseRfsiForGroup(gid) : '';
+            const groupLabel = pulseGroupLabel(gid);
             row.classList.toggle('pulse-fill-active', isActive);
             row.classList.toggle('pulse-fill-at-risk', atRisk);
             row.classList.toggle('pulse-fill-on-air', onAir);
+            patchPlaySlot(row.querySelector('.pulse-fill-play-slot'), g, isActive);
+            const nameEl = row.querySelector('.pulse-fill-name');
+            if (nameEl) {
+                const nextName = (src === 'tetrapol' ? '📻 ' : '✈️ ') + groupLabel;
+                if (nameEl.textContent !== nextName) nameEl.textContent = nextName;
+                nameEl.title = `Groupe ${gid}`;
+            }
+            const idEl = row.querySelector('.pulse-fill-id');
+            if (idEl && idEl.textContent !== `#${gid}`) idEl.textContent = `#${gid}`;
+            patchClearBtn(row.querySelector('.pulse-fill-title-row'), g, bufSec > 0.15 || pct > 0);
+            const rfsiEl = row.querySelector('.pulse-fill-rfsi');
+            if (rfsiEl) {
+                const nextRfsi = rfsiText || '—';
+                if (rfsiEl.textContent !== nextRfsi) rfsiEl.textContent = nextRfsi;
+                rfsiEl.classList.toggle('pulse-fill-rfsi-empty', !rfsiText);
+            }
             const meter = row.querySelector('.pulse-fill-meter');
             if (meter) {
                 meter.classList.toggle('pulse-fill-meter-risk', atRisk);
+                const bar = meter.querySelector('.pulse-fill-bar');
+                if (bar) bar.setAttribute('aria-valuenow', String(pct));
                 const inner = meter.querySelector('.pulse-fill-bar-inner');
                 if (inner) inner.style.width = pct + '%';
                 const timeEl = meter.querySelector('.pulse-fill-time');
@@ -5070,85 +5256,80 @@
                 if (g.suspended) html += '<span class="pulse-fill-badge suspended">PAUSE</span>';
                 if (onAir) html += '<span class="pulse-fill-badge on-air">ON AIR</span>';
                 if (forceSoon && !isActive) html += '<span class="pulse-fill-badge force">≥92%</span>';
-                badges.innerHTML = html;
+                if (badges.innerHTML !== html) badges.innerHTML = html;
             }
         };
 
-        if (!rebuildStruct) {
-            listenGroups.forEach((g) => {
-                const row = listEl.querySelector(
-                    '.pulse-fill-row[data-source="' + cssEscapeAttr(g.source) + '"][data-group-id="'
-                    + cssEscapeAttr(String(g.group_id)) + '"]'
-                );
-                if (row) patchRowFill(row, g);
-            });
-            return;
-        }
+        const createPulseFillRow = (g) => {
+            const row = document.createElement('div');
+            row.className = 'pulse-fill-row';
+            row.dataset.groupId = String(g.group_id);
+            row.dataset.source = g.source || 'airband';
+            row.innerHTML =
+                '<div class="pulse-fill-play-slot"></div>'
+                + '<div class="pulse-fill-main">'
+                + '<div class="pulse-fill-title-row">'
+                + '<div class="pulse-fill-name"></div>'
+                + '<span class="pulse-fill-id"></span>'
+                + '</div>'
+                + '<div class="pulse-fill-rfsi pulse-fill-rfsi-empty">—</div>'
+                + '</div>'
+                + '<div class="pulse-fill-badges"></div>'
+                + '<div class="pulse-fill-meter">'
+                + '<div class="pulse-fill-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">'
+                + '<div class="pulse-fill-bar-inner" style="width:0%"></div></div>'
+                + '<div class="pulse-fill-meter-meta">'
+                + '<span class="pulse-fill-time"></span>'
+                + '<span class="pulse-fill-pct"></span>'
+                + '</div></div>';
+            return row;
+        };
 
-        const activeLabel = activeId ? pulseGroupLabel(activeId) : null;
-        let summaryHtml = '<span class="pulse-mode-badge">File exclusive</span> ';
-        if (manualHold) {
-            summaryHtml += '<span class="pulse-fill-badge suspended">MANUEL</span> ';
-        }
-        if (activeId) {
-            const rfsiText = activeSource === 'tetrapol' ? pulseRfsiForGroup(activeId) : '';
-            const srcBadge = activeSource === 'tetrapol' ? 'TP' : (activeSource === 'airband' ? 'AB' : '');
-            summaryHtml += '<div class="pulse-active-block">';
-            summaryHtml += '<div class="pulse-active-main">';
-            summaryHtml += '<div class="pulse-active-line">'
-                + '<span class="pulse-active-prefix">▶ En lecture :</span> '
-                + (srcBadge ? `<span class="pulse-mode-badge">${srcBadge}</span> ` : '')
-                + `<span class="pulse-active-name" title="${escHtml(activeLabel)} (#${escHtml(activeId)})">${escHtml(activeLabel)}</span> `
-                + `<span class="pulse-active-id">(#${escHtml(activeId)})</span>`
-                + '</div>';
-            if (rfsiText) {
-                summaryHtml += `<div class="pulse-active-rfsi" title="RFSI">${escHtml(rfsiText)}</div>`;
+        const buildArbiterLineHtml = () => {
+            if (!(pulseArbiterState && pulseArbiterState.enabled
+                && (pulseArbiterState.active || (pulseArbiterState.queue && pulseArbiterState.queue.length)))) {
+                return '';
             }
-            summaryHtml += '</div>';
-            summaryHtml += '<div class="pulse-active-actions">';
-            summaryHtml += '<button type="button" class="pulse-manual-btn pulse-stop-btn" data-pulse-action="stop" title="Arrêter la lecture Pulse (sans relance auto)">⏹ Stop</button>';
-            summaryHtml += `<button type="button" class="pulse-manual-btn pulse-clear-btn" data-pulse-action="clear" data-group-id="${escHtml(activeId)}" data-source="${escHtml(activeSource || 'airband')}" title="Vider le tampon et revenir au direct">✕</button>`;
-            summaryHtml += '</div></div>';
-        } else {
-            summaryHtml += '▶ Aucun groupe actif (en attente de PCM ou fin de transmission) ';
-        }
-        if (manualHold) {
-            summaryHtml += '<button type="button" class="pulse-manual-btn" data-pulse-action="auto" title="Reprendre la file automatique">↻ Auto</button> ';
-        }
-        if (forceOn) {
-            summaryHtml += ` · ⚡ Bascule tampon ≥ ${Math.round(forceRatio * 100)} %`;
-        }
-        if (pulseArbiterState && pulseArbiterState.enabled
-            && (pulseArbiterState.active || (pulseArbiterState.queue && pulseArbiterState.queue.length))) {
             const a = pulseArbiterState.active;
             const q = pulseArbiterState.queue || [];
             const srcLabel = (s) => (s === 'tetrapol' ? 'TP' : 'AB');
-            summaryHtml += '<div class="pulse-arbiter-line" title="File Pulse unifiée Airband + Tetrapol">';
-            summaryHtml += '<span class="pulse-mode-badge">File unifiée</span> ';
+            let html = '<span class="pulse-mode-badge">File unifiée</span> ';
             if (a) {
-                summaryHtml += `▶ ${srcLabel(a.source)} #${escHtml(String(a.id))}`;
-                if (a.priority) summaryHtml += ' ★';
+                html += `▶ ${srcLabel(a.source)} #${escHtml(String(a.id))}`;
+                if (a.priority) html += ' ★';
             } else {
-                summaryHtml += '▶ —';
+                html += '▶ —';
             }
             if (q.length) {
-                summaryHtml += ' · file: ' + q.map((s, i) =>
+                html += ' · file: ' + q.map((s, i) =>
                     `${i + 1}. ${srcLabel(s.source)} #${escHtml(String(s.id))}${s.priority ? '★' : ''}`
                 ).join(' → ');
             }
-            summaryHtml += '</div>';
-        }
-        summaryEl.innerHTML = summaryHtml;
+            return html;
+        };
 
-        if (!listenGroups.length) {
-            listEl.innerHTML = '<div class="pulse-fill-empty">Aucun groupe activé pour PulseAudio.</div>';
-            return;
-        }
+        const syncArbiterLine = () => {
+            const html = buildArbiterLineHtml();
+            let line = summaryEl.querySelector('.pulse-arbiter-line');
+            if (!html) {
+                if (line) line.remove();
+                return;
+            }
+            if (!line) {
+                line = document.createElement('div');
+                line.className = 'pulse-arbiter-line';
+                line.title = 'File Pulse unifiée Airband + Tetrapol';
+                summaryEl.appendChild(line);
+            }
+            if (line.innerHTML !== html) line.innerHTML = html;
+        };
 
-        listEl.innerHTML = '';
-        listenGroups.forEach((g) => {
-            const gid = String(g.group_id);
-            const src = g.source || 'airband';
+        const activeFillMeta = () => {
+            if (!activeId) return { fill: 0, bufSec: 0, pct: 0, atRisk: false };
+            const g = listenGroups.find((x) =>
+                String(x.group_id) === activeId
+                && (!activeSource || (x.source || 'airband') === activeSource)
+            ) || {};
             let fill = Number(g.fill_ratio);
             if (!Number.isFinite(fill)) fill = 0;
             if (fill > 1) fill = fill / 100;
@@ -5156,119 +5337,166 @@
             let bufSec = Number(g.buffer_seconds);
             if (!Number.isFinite(bufSec)) bufSec = 0;
             if (bufSec > 0 && maxSec > 0) fill = Math.min(fill, bufSec / maxSec);
-            const pct = Math.round(fill * 100);
-            const atRisk = fill >= atRiskRatio;
-            const forceSoon = fill >= forceRatio;
-            const isActive = !!(g.is_active || (gid === activeId && (!activeSource || src === activeSource)));
-            const rfsiText = src === 'tetrapol' ? pulseRfsiForGroup(gid) : '';
-            const groupLabel = pulseGroupLabel(gid);
-            const onAir = !!g.on_air;
+            return {
+                fill,
+                bufSec,
+                pct: Math.round(fill * 100),
+                atRisk: fill >= atRiskRatio
+            };
+        };
 
-            const row = document.createElement('div');
-            row.className = 'pulse-fill-row'
-                + (isActive ? ' pulse-fill-active' : '')
-                + (atRisk ? ' pulse-fill-at-risk' : '')
-                + (onAir ? ' pulse-fill-on-air' : '');
-            row.dataset.groupId = gid;
-            row.dataset.source = src;
+        const syncActiveMeter = () => {
+            const block = summaryEl.querySelector('.pulse-active-block');
+            if (!block || !activeId) return;
+            let meter = block.querySelector('.pulse-active-meter');
+            if (!meter) {
+                meter = document.createElement('div');
+                meter.className = 'pulse-active-meter pulse-fill-meter';
+                meter.innerHTML =
+                    '<div class="pulse-fill-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">'
+                    + '<div class="pulse-fill-bar-inner" style="width:0%"></div></div>'
+                    + '<div class="pulse-fill-meter-meta">'
+                    + '<span class="pulse-fill-time"></span>'
+                    + '<span class="pulse-fill-pct"></span>'
+                    + '</div>';
+                block.appendChild(meter);
+            }
+            const meta = activeFillMeta();
+            meter.classList.toggle('pulse-fill-meter-risk', meta.atRisk);
+            const bar = meter.querySelector('.pulse-fill-bar');
+            if (bar) bar.setAttribute('aria-valuenow', String(meta.pct));
+            const inner = meter.querySelector('.pulse-fill-bar-inner');
+            if (inner) inner.style.width = meta.pct + '%';
+            const timeEl = meter.querySelector('.pulse-fill-time');
+            if (timeEl) timeEl.textContent = formatPulseBufferSeconds(meta.bufSec, maxSec);
+            const pctEl = meter.querySelector('.pulse-fill-pct');
+            if (pctEl) pctEl.textContent = meta.pct + ' %';
+        };
 
-            const playSlot = document.createElement('div');
-            playSlot.className = 'pulse-fill-play-slot';
-            if (isActive) {
-                playSlot.innerHTML = '<span class="pulse-fill-active-icon" title="En lecture" aria-hidden="true">▶</span>';
+        const chromeKey = [2, activeId, activeSource, manualHold ? 1 : 0, forceOn ? 1 : 0].join('|');
+        if (summaryEl.dataset.pulseChrome !== chromeKey) {
+            summaryEl.dataset.pulseChrome = chromeKey;
+            const activeLabel = activeId ? pulseGroupLabel(activeId) : null;
+            let summaryHtml = '<span class="pulse-mode-badge">File exclusive</span> ';
+            if (manualHold) {
+                summaryHtml += '<span class="pulse-fill-badge suspended">MANUEL</span> ';
+            }
+            if (activeId) {
+                const rfsiText = activeSource === 'tetrapol' ? pulseRfsiForGroup(activeId) : '';
+                const srcBadge = activeSource === 'tetrapol' ? 'TP' : (activeSource === 'airband' ? 'AB' : '');
+                const fillMeta = activeFillMeta();
+                summaryHtml += '<div class="pulse-active-block">';
+                summaryHtml += '<div class="pulse-active-main">';
+                summaryHtml += '<div class="pulse-active-line">'
+                    + '<span class="pulse-active-prefix">▶ En lecture :</span> '
+                    + (srcBadge ? `<span class="pulse-mode-badge">${srcBadge}</span> ` : '')
+                    + `<span class="pulse-active-name" title="${escHtml(activeLabel)} (#${escHtml(activeId)})">${escHtml(activeLabel)}</span> `
+                    + `<span class="pulse-active-id">(#${escHtml(activeId)})</span>`
+                    + '</div>';
+                if (rfsiText) {
+                    summaryHtml += `<div class="pulse-active-rfsi" title="RFSI">${escHtml(rfsiText)}</div>`;
+                }
+                summaryHtml += '</div>';
+                summaryHtml += '<div class="pulse-active-actions">';
+                summaryHtml += '<button type="button" class="pulse-manual-btn pulse-pause-btn" data-pulse-action="pause" title="Pause : arrêter la lecture sans relance auto (mode manuel)">⏸ Pause</button>';
+                summaryHtml += `<button type="button" class="pulse-manual-btn pulse-stop-btn" data-pulse-action="stop" data-group-id="${escHtml(activeId)}" data-source="${escHtml(activeSource || 'airband')}" title="Stop : désactiver ce groupe Pulse (plus d'écoute jusqu'au clic sur son bouton)">⏹ Stop</button>`;
+                summaryHtml += `<button type="button" class="pulse-manual-btn pulse-clear-btn" data-pulse-action="clear" data-group-id="${escHtml(activeId)}" data-source="${escHtml(activeSource || 'airband')}" title="Vider le tampon et revenir au direct">✕</button>`;
+                summaryHtml += '</div>';
+                summaryHtml += `<div class="pulse-active-meter pulse-fill-meter${fillMeta.atRisk ? ' pulse-fill-meter-risk' : ''}">`
+                    + `<div class="pulse-fill-bar" role="progressbar" aria-valuenow="${fillMeta.pct}" aria-valuemin="0" aria-valuemax="100">`
+                    + `<div class="pulse-fill-bar-inner" style="width:${fillMeta.pct}%"></div></div>`
+                    + '<div class="pulse-fill-meter-meta">'
+                    + `<span class="pulse-fill-time">${escHtml(formatPulseBufferSeconds(fillMeta.bufSec, maxSec))}</span>`
+                    + `<span class="pulse-fill-pct">${fillMeta.pct} %</span>`
+                    + '</div></div>';
+                summaryHtml += '</div>';
             } else {
-                const playBtn = document.createElement('button');
-                playBtn.type = 'button';
-                playBtn.className = 'pulse-manual-btn pulse-fill-play-btn';
-                playBtn.title = 'Lancer ce groupe sur PulseAudio maintenant';
-                playBtn.setAttribute('data-pulse-action', 'play');
-                playBtn.setAttribute('data-group-id', gid);
-                playBtn.setAttribute('data-source', src);
-                playBtn.textContent = '▶';
-                playSlot.appendChild(playBtn);
+                summaryHtml += '▶ Aucun groupe actif (en attente de PCM ou fin de transmission) ';
             }
-
-            const main = document.createElement('div');
-            main.className = 'pulse-fill-main';
-            const titleRow = document.createElement('div');
-            titleRow.className = 'pulse-fill-title-row';
-            const name = document.createElement('div');
-            name.className = 'pulse-fill-name';
-            name.textContent = (src === 'tetrapol' ? '📻 ' : '✈️ ') + groupLabel;
-            name.title = `Groupe ${gid}`;
-            const idEl = document.createElement('span');
-            idEl.className = 'pulse-fill-id';
-            idEl.textContent = `#${gid}`;
-            titleRow.appendChild(name);
-            titleRow.appendChild(idEl);
-            if (bufSec > 0.15 || pct > 0) {
-                const clearBtn = document.createElement('button');
-                clearBtn.type = 'button';
-                clearBtn.className = 'pulse-manual-btn pulse-clear-btn pulse-fill-clear-btn';
-                clearBtn.title = 'Vider le tampon et revenir au direct';
-                clearBtn.setAttribute('data-pulse-action', 'clear');
-                clearBtn.setAttribute('data-group-id', gid);
-                clearBtn.setAttribute('data-source', src);
-                clearBtn.textContent = '✕';
-                titleRow.appendChild(clearBtn);
+            if (manualHold) {
+                summaryHtml += '<button type="button" class="pulse-manual-btn" data-pulse-action="auto" title="Reprendre la file automatique">↻ Auto</button> ';
             }
-            main.appendChild(titleRow);
-            const rfsiEl = document.createElement('div');
-            rfsiEl.className = 'pulse-fill-rfsi' + (rfsiText ? '' : ' pulse-fill-rfsi-empty');
-            rfsiEl.textContent = rfsiText || '—';
-            main.appendChild(rfsiEl);
+            if (forceOn) {
+                summaryHtml += ` · ⚡ Bascule tampon ≥ ${Math.round(forceRatio * 100)} %`;
+            }
+            summaryEl.innerHTML = summaryHtml;
+        } else {
+            const rfsiText = activeSource === 'tetrapol' && activeId ? pulseRfsiForGroup(activeId) : '';
+            const main = summaryEl.querySelector('.pulse-active-main');
+            if (main) {
+                let rfsiEl = main.querySelector('.pulse-active-rfsi');
+                if (rfsiText) {
+                    if (!rfsiEl) {
+                        rfsiEl = document.createElement('div');
+                        rfsiEl.className = 'pulse-active-rfsi';
+                        rfsiEl.title = 'RFSI';
+                        main.appendChild(rfsiEl);
+                    }
+                    if (rfsiEl.textContent !== rfsiText) rfsiEl.textContent = rfsiText;
+                } else if (rfsiEl) {
+                    rfsiEl.remove();
+                }
+            }
+        }
+        syncActiveMeter();
+        syncArbiterLine();
 
-            const badges = document.createElement('div');
-            badges.className = 'pulse-fill-badges';
-            if (isActive) badges.innerHTML += '<span class="pulse-fill-badge active">ACTIF</span>';
-            else if (g.in_queue) badges.innerHTML += '<span class="pulse-fill-badge queue" title="En file d\'attente">FILE</span>';
-            if (g.priority) badges.innerHTML += '<span class="pulse-fill-badge priority">PRIO</span>';
-            if (g.suspended) badges.innerHTML += '<span class="pulse-fill-badge suspended">PAUSE</span>';
-            if (onAir) badges.innerHTML += '<span class="pulse-fill-badge on-air">ON AIR</span>';
-            if (forceSoon && !isActive) badges.innerHTML += '<span class="pulse-fill-badge force">≥92%</span>';
+        if (!listenGroups.length) {
+            if (listEl.dataset.pulseEmpty !== '1') {
+                listEl.dataset.pulseEmpty = '1';
+                listEl.innerHTML = '<div class="pulse-fill-empty">Aucun groupe activé pour PulseAudio.</div>';
+            }
+            return;
+        }
+        listEl.dataset.pulseEmpty = '0';
+        const emptyEl = listEl.querySelector('.pulse-fill-empty');
+        if (emptyEl) emptyEl.remove();
 
-            const meter = document.createElement('div');
-            meter.className = 'pulse-fill-meter' + (atRisk ? ' pulse-fill-meter-risk' : '');
-            meter.innerHTML =
-                `<div class="pulse-fill-bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">`
-                + `<div class="pulse-fill-bar-inner" style="width:${pct}%"></div></div>`
-                + `<div class="pulse-fill-meter-meta">`
-                + `<span class="pulse-fill-time">${escHtml(formatPulseBufferSeconds(bufSec, maxSec))}</span>`
-                + `<span class="pulse-fill-pct">${pct} %</span>`
-                + `</div>`;
-
-            row.appendChild(playSlot);
-            row.appendChild(main);
-            row.appendChild(badges);
-            row.appendChild(meter);
-            listEl.appendChild(row);
+        const wanted = new Set();
+        listenGroups.forEach((g, i) => {
+            const src = g.source || 'airband';
+            const gid = String(g.group_id);
+            wanted.add(src + ':' + gid);
+            let row = listEl.querySelector(
+                '.pulse-fill-row[data-source="' + cssEscapeAttr(src) + '"][data-group-id="'
+                + cssEscapeAttr(gid) + '"]'
+            );
+            if (!row) {
+                row = createPulseFillRow(g);
+            }
+            patchRowFill(row, g);
+            const current = listEl.children[i];
+            if (current !== row) listEl.insertBefore(row, current || null);
+        });
+        [...listEl.querySelectorAll('.pulse-fill-row')].forEach((row) => {
+            const key = (row.dataset.source || '') + ':' + (row.dataset.groupId || '');
+            if (!wanted.has(key)) row.remove();
         });
     }
 
     function wirePulseAdminControls() {
         const toggle = document.getElementById('pulseExclusivePlaybackToggle');
         const force = document.getElementById('pulseExclusiveForceBufferToggle');
+        const catchup = document.getElementById('pulseCatchupFastToggle');
+        const syncSettings = () => {
+            lastPulseSig = '';
+            apiPulseExclusiveBoth({
+                exclusive: toggle ? toggle.checked : true,
+                force_before_full: force ? force.checked : true,
+                catchup_fast: catchup ? catchup.checked : false
+            });
+        };
         if (toggle && !toggle.dataset.bound) {
             toggle.dataset.bound = '1';
-            toggle.addEventListener('change', () => {
-                lastPulseSig = '';
-                apiPulseExclusiveBoth({
-                    exclusive: toggle.checked,
-                    force_before_full: force ? force.checked : true
-                });
-            });
+            toggle.addEventListener('change', syncSettings);
         }
         if (force && !force.dataset.bound) {
             force.dataset.bound = '1';
-            force.addEventListener('change', () => {
-                lastPulseSig = '';
-                // Always send both flags so the peer cannot keep a stale force value
-                // while exclusive is inferred from a partial POST.
-                apiPulseExclusiveBoth({
-                    exclusive: toggle ? toggle.checked : true,
-                    force_before_full: force.checked
-                });
-            });
+            force.addEventListener('change', syncSettings);
+        }
+        if (catchup && !catchup.dataset.bound) {
+            catchup.dataset.bound = '1';
+            catchup.addEventListener('change', syncSettings);
         }
         // Pas de redémarrage mixer Tetrapol côté Airband
         const restart = document.getElementById('restartMixerBtn');
@@ -5699,7 +5927,6 @@
             updateAirbandButtons();
             updateReceptionDisplay();
             syncPlayersFromCatalog();
-            lastPulseSig = '';
         }
         if (msg.NETWORKS) {
             applyNetworksPayload(msg.NETWORKS);

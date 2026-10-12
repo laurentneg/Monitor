@@ -288,6 +288,7 @@ h1 {
 #exclusiveForceBufferToggle,
 #pulseExclusivePlaybackToggle,
 #pulseExclusiveForceBufferToggle,
+#pulseCatchupFastToggle,
 #exclusiveAutoPromoteAtRisk {
     width: 18px;
     height: 18px;
@@ -839,6 +840,7 @@ tr:hover {
     gap: 0.5em;
     margin-top: 0.35em;
     margin-bottom: 0.75em;
+    align-items: center;
 }
 
 .group-btn {
@@ -981,6 +983,7 @@ tr:hover {
     text-align: center;
     opacity: 0.5;
     font-weight: normal;
+    position: relative;
     -webkit-user-select: none;
     user-select: none;
     -webkit-touch-callout: none;
@@ -1050,11 +1053,6 @@ tr:hover {
     animation: pulse-glow-priority 1.5s infinite;
 }
 
-.pulse-btn.pulse-active.enabled {
-    outline: 2px solid #4af;
-    outline-offset: 2px;
-}
-
 .pulse-exclusive-status {
     margin: 1em 0 0;
     padding: 0.75em 1em;
@@ -1079,7 +1077,10 @@ tr:hover {
 .pulse-active-block {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
-    gap: 0.75em 1.25em;
+    grid-template-areas:
+        "main actions"
+        "meter meter";
+    gap: 0.55em 1.25em;
     align-items: center;
     width: 100%;
     margin: 0.5em 0 0.35em;
@@ -1090,14 +1091,32 @@ tr:hover {
 }
 
 .pulse-active-main {
+    grid-area: main;
     min-width: 0;
 }
 
 .pulse-active-actions {
+    grid-area: actions;
     display: flex;
     flex-wrap: wrap;
     gap: 0.35em;
     align-items: center;
+}
+
+.pulse-active-meter {
+    grid-area: meter;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.28em;
+}
+
+.pulse-active-meter .pulse-fill-bar {
+    height: 10px;
+}
+
+.pulse-active-meter .pulse-fill-meter-meta {
+    font-size: 0.86em;
 }
 
 .pulse-active-prefix {
@@ -1479,6 +1498,9 @@ tr:hover {
     color: #9cf;
     cursor: pointer;
     white-space: nowrap;
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 .pulse-manual-btn:hover {
@@ -1494,6 +1516,17 @@ tr:hover {
 
 .pulse-manual-btn.pulse-stop-btn:hover {
     background: #3a2020;
+}
+
+.pulse-manual-btn.pulse-pause-btn {
+    border-color: #a80;
+    color: #fc8;
+    background: #2a2418;
+}
+
+.pulse-manual-btn.pulse-pause-btn:hover {
+    background: #3a3018;
+    color: #ffd08a;
 }
 
 .pulse-manual-btn.pulse-clear-btn {
@@ -1569,6 +1602,73 @@ tr:hover {
     font-weight: normal !important;
     box-shadow: 0 0 10px rgba(136, 85, 68, 0.4) !important;
     animation: pulse-glow-dim 1.5s infinite;
+}
+
+/* Groupe actuellement en lecture Pulse : taille normale + halo cyan + label LECTURE */
+.pulse-btn.enabled.pulse-active {
+    z-index: 2;
+    transform: none;
+    font-size: 0.9em;
+    padding: 0.4em 0.8em;
+    min-width: 80px;
+    border-width: 2px;
+    border-color: #6df !important;
+    background: linear-gradient(180deg, #1a6ea8 0%, #0e8a6a 100%) !important;
+    color: #fff !important;
+    opacity: 1 !important;
+    font-weight: 800 !important;
+    box-shadow:
+        0 0 0 2px rgba(120, 220, 255, 0.5),
+        0 0 16px rgba(40, 200, 255, 0.75) !important;
+    animation: pulse-glow-playing 1.3s ease-in-out infinite;
+}
+
+.pulse-btn.enabled.pulse-active:hover {
+    transform: translateY(-1px);
+    box-shadow:
+        0 0 0 2px rgba(160, 235, 255, 0.65),
+        0 0 20px rgba(80, 220, 255, 0.9) !important;
+}
+
+.pulse-btn.priority.enabled.pulse-active {
+    border-color: #faa !important;
+    background: linear-gradient(180deg, #a33 0%, #c45 55%, #1a8 100%) !important;
+    box-shadow:
+        0 0 0 3px rgba(255, 160, 160, 0.45),
+        0 0 28px rgba(255, 80, 80, 0.55) !important;
+}
+
+.pulse-btn.enabled.pulse-active .pulse-btn-label::before {
+    content: "▶ ";
+}
+
+.pulse-btn.enabled.pulse-active::after {
+    content: "LECTURE";
+    display: block;
+    margin-top: 0.2em;
+    font-size: 0.62em;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    color: #e8ffff;
+    line-height: 1;
+}
+
+@keyframes pulse-glow-playing {
+    0%, 100% {
+        box-shadow:
+            0 0 0 2px rgba(120, 220, 255, 0.4),
+            0 0 12px rgba(40, 200, 255, 0.55);
+    }
+    50% {
+        box-shadow:
+            0 0 0 2px rgba(180, 240, 255, 0.7),
+            0 0 20px rgba(80, 230, 255, 0.85);
+    }
+}
+
+#pulseAudioButtonsContainer.group-buttons-grid {
+    padding: 0.55em 0.2em 0.7em;
+    overflow: visible;
 }
 
 #reloadLabelsBtn:hover:not(:disabled) {

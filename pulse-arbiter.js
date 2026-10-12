@@ -17,12 +17,44 @@ const PRIORITY_PREEMPT_GRACE_MS = 400;
 const PROMOTION_GRACE_MS = 15000;
 /** If a source WS stays down while active, force failover. */
 const SOURCE_DOWN_FAILOVER_MS = 2500;
+/** Ignore stale active_group_id telemetry after a yield (WS lag). */
+const YIELD_ADOPT_GUARD_MS = 4000;
+/** After activate, wait before judging a non-draining buffer as stuck. */
+const STUCK_FILL_GRACE_MS = 5000;
+/** No fill drop for this long + rising unread → stuck (Pulse not consuming). */
+const STUCK_FILL_MS = 8000;
+/** Minimum unread rise since grant to treat a non-draining active as stuck. */
+const STUCK_FILL_RISE = 0.025;
+/** Flat non-draining buffer (no drop) while holding meaningful unread. */
+const STUCK_FLAT_MS = 15000;
+/** Minimum fill to treat a flat unread buffer as stuck. */
+const STUCK_FLAT_MIN_FILL = 0.05;
+/** After UI ▶, block ★ preemption so the forced channel can actually play. */
+const FORCE_PLAY_SHIELD_MS = 20000;
+/** After a stuck release, ban that seat from ★ preempt / promote briefly. */
+const STUCK_BAN_MS = 45000;
 
 function keyOf(source, id) {
     return `${source}:${String(id)}`;
 }
 
-function postJson(baseUrl, apiPath, body) {
+function isTransportError(err) {
+    const code = err && err.code ? String(err.code) : '';
+    if ([
+        'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+        'EHOSTUNREACH', 'EAI_AGAIN', 'EPIPE', 'ECONNABORTED',
+    ].includes(code)) return true;
+    const msg = String(err && err.message ? err.message : err || '');
+    return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|EAI_AGAIN|EPIPE|socket hang up|^timeout /i.test(msg);
+}
+
+/**
+ * Local command POST. A dead or hung peer must not sit on the arbiter queue
+ * for the default 8s: exclusive play/yield is expected to answer in milliseconds.
+ */
+const COMMAND_TIMEOUT_MS = 1500;
+
+function postJson(baseUrl, apiPath, body, timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
         let url;
         try {
@@ -45,7 +77,7 @@ function postJson(baseUrl, apiPath, body) {
                     'Content-Length': Buffer.byteLength(payload),
                     Connection: 'close',
                 },
-                timeout: 8000,
+                timeout: timeoutMs,
             },
             (res) => {
                 const chunks = [];
@@ -107,6 +139,28 @@ class PulseArbiter {
         /** WS connectivity as seen by the monitor bridge. */
         this._sourceConnected = { airband: true, tetrapol: true };
         this._sourceDownSinceMs = { airband: 0, tetrapol: 0 };
+        /**
+         * HTTP command channel dead (ECONNREFUSED, timeout, …).
+         * Independent of WS: a hung project can keep the socket open.
+         * Heartbeats keep probing; play/yield skip it until a probe succeeds.
+         */
+        this._httpDown = { airband: false, tetrapol: false };
+        /**
+         * UI « ⏹ Stop » : do not auto-promote until « ↻ Auto ».
+         * Distinct from project `manual_hold` which the arbiter also sets while
+         * commanding play/yield (so the UI must not treat that as user-manual).
+         */
+        this._userHold = false;
+        /** @type {Map<string, number>} key → Date.now() until which adopt is blocked */
+        this._yieldGuardUntil = new Map();
+        /** Last promoteNext "wait for PCM" head key (log once). */
+        this._promoteWaitLogKey = '';
+        /** Watch unread fill of the commanded active (detect Pulse not draining). */
+        this._fillWatch = null;
+        /** Until when ★ must not steal after a UI forcePlay. */
+        this._forceShieldUntil = 0;
+        /** @type {Map<string, number>} stuck seats banned from activate/preempt */
+        this._stuckBanUntil = new Map();
     }
 
     start() {
@@ -147,6 +201,7 @@ class PulseArbiter {
             monitor_alive: this.enabled,
             monitor_id: this.monitorId,
             lease_ms: HEARTBEAT_LEASE_MS,
+            user_hold: !!this._userHold,
             active,
             queue: this.globalQueue.map((s) => ({
                 source: s.source,
@@ -155,7 +210,10 @@ class PulseArbiter {
                 fill_ratio: qFill(s.fill_ratio),
                 buffer_force_promoted: !!s.buffer_force_promoted,
             })),
-            sources: { ...this._sourceConnected },
+            sources: {
+                airband: !this.sourceAbsent('airband'),
+                tetrapol: !this.sourceAbsent('tetrapol'),
+            },
         };
     }
 
@@ -176,21 +234,24 @@ class PulseArbiter {
         if (!this.enabled) return;
         this.refreshActiveMeta();
         this.maybeReleaseEndedActive();
+        this.maybeReleaseStuckActive();
         // Rebuild FIFO from project listen_groups when claim HTTP lagged / missed.
         const added = this.syncWaitersFromTelemetry();
         if (this._busy) return;
-        if (!this.globalActive) {
+        if (!this.globalActive && !this._userHold) {
             this.adoptLocalActivesIfIdle();
         }
+        // UI Stop : ne pas relancer (promote / force / préemption) tant que « Auto ».
         if (this.globalActive) {
-            this.maybePriorityPreempt();
-            this.maybeForcePromote();
-        } else if (this.globalQueue.length > 0 || added > 0) {
+            if (!this._userHold) {
+                this.maybePriorityPreempt();
+                this.maybeForcePromote();
+            }
+        } else if (!this._userHold && (this.globalQueue.length > 0 || added > 0)) {
             this.enqueueCommand(async () => {
-                if (!this.globalActive && this.globalQueue.length > 0) {
-                    await this.promoteNext();
-                    this.notifyChange();
-                }
+                if (this._userHold || this.globalActive || this.globalQueue.length === 0) return;
+                await this.promoteNext();
+                this.notifyChange();
             });
         }
     }
@@ -200,9 +261,12 @@ class PulseArbiter {
         const now = Date.now();
         for (const source of ['airband', 'tetrapol']) {
             const connected = status[source] !== false;
+            const was = this._sourceConnected[source] !== false;
             this._sourceConnected[source] = connected;
             if (connected) {
-                this._sourceDownSinceMs[source] = 0;
+                // Fresh WS session: the process is back, probe HTTP again.
+                if (!was) this._httpDown[source] = false;
+                if (!this._httpDown[source]) this._sourceDownSinceMs[source] = 0;
             } else if (!this._sourceDownSinceMs[source]) {
                 this._sourceDownSinceMs[source] = now;
             }
@@ -213,7 +277,7 @@ class PulseArbiter {
     maybeFailoverFromDownSource() {
         if (!this.enabled || !this.globalActive || this._busy) return;
         const src = this.globalActive.source;
-        if (this._sourceConnected[src] !== false) return;
+        if (!this.sourceAbsent(src)) return;
         const downSince = this._sourceDownSinceMs[src] || 0;
         if (!downSince || (Date.now() - downSince) < SOURCE_DOWN_FAILOVER_MS) return;
 
@@ -234,7 +298,7 @@ class PulseArbiter {
                 this.syncWaitersFromTelemetry({
                     excludeKeys: new Set([keyOf(ended.source, ended.id)]),
                 });
-                await this.promoteNext();
+                if (!this._userHold) await this.promoteNext();
                 this.notifyChange();
             } finally {
                 this._busy = false;
@@ -242,19 +306,34 @@ class PulseArbiter {
         });
     }
 
-    /** True if telemetry shows real audio (live or residual buffer) — not a hollow queue seat. */
-    hasPlayableAudio(g) {
+    /**
+     * True if telemetry shows buffered PCM worth playing — not a hollow on_air seat.
+     * on_air alone is NOT enough: projects often keep on_air with fill=0% between
+     * packets / after eof lag, and promoting those caused dual AB+TP audio.
+     */
+    hasBufferedAudio(g) {
         if (!g) return false;
-        if (g.on_air) return true;
         const buf = Number(g.buffer_seconds) || 0;
         if (buf >= 0.05) return true;
         const fill = Number(g.fill_ratio);
         return Number.isFinite(fill) && fill > 0.001;
     }
 
+    /** Live or buffered — for keeping a FIFO seat (not for promote/activate). */
+    hasLiveOrBufferedAudio(g) {
+        if (!g) return false;
+        if (g.on_air || g.suspended) return true;
+        return this.hasBufferedAudio(g);
+    }
+
+    /** @deprecated alias — prefer hasBufferedAudio for promote paths */
+    hasPlayableAudio(g) {
+        return this.hasBufferedAudio(g);
+    }
+
     /**
      * Drop waiters that no longer have audio (stale claims / emptied rings).
-     * Keeps FIFO honest so promoteNext never activates fill=0% ghosts.
+     * Keeps on_air seats even at fill=0% (waiting for first PCM); drops dead hollows.
      */
     pruneDrainedWaiters() {
         if (!this.globalQueue.length) return 0;
@@ -262,7 +341,7 @@ class PulseArbiter {
         const dropped = [];
         for (const s of this.globalQueue) {
             const meta = this.groupMeta(this._snap[s.source] || {}, s.id);
-            if (this.hasPlayableAudio(meta)) {
+            if (this.hasLiveOrBufferedAudio(meta)) {
                 s.fill_ratio = meta.fill_ratio;
                 s.buffer_force_promoted = meta.buffer_force_promoted;
                 s.priority = meta.priority || s.priority;
@@ -279,13 +358,147 @@ class PulseArbiter {
         return dropped.length;
     }
 
+    noteYieldGuard(source, id) {
+        if (!id) return;
+        this._yieldGuardUntil.set(
+            keyOf(source, String(id)),
+            Date.now() + YIELD_ADOPT_GUARD_MS
+        );
+    }
+
+    isYieldGuarded(source, id) {
+        if (!id) return false;
+        const until = this._yieldGuardUntil.get(keyOf(source, String(id))) || 0;
+        return until > Date.now();
+    }
+
+    noteStuckBan(source, id) {
+        if (!id) return;
+        this._stuckBanUntil.set(
+            keyOf(source, String(id)),
+            Date.now() + STUCK_BAN_MS
+        );
+    }
+
+    isStuckBanned(source, id) {
+        if (!id) return false;
+        const k = keyOf(source, String(id));
+        const until = this._stuckBanUntil.get(k) || 0;
+        if (until <= Date.now()) {
+            if (until) this._stuckBanUntil.delete(k);
+            return false;
+        }
+        return true;
+    }
+
+    resetFillWatch(fillHint) {
+        if (!this.globalActive) {
+            this._fillWatch = null;
+            return;
+        }
+        const fill = Number.isFinite(Number(fillHint))
+            ? Number(fillHint)
+            : Number(this.globalActive.fill_ratio) || 0;
+        this._fillWatch = {
+            key: keyOf(this.globalActive.source, this.globalActive.id),
+            fillAtGrant: fill,
+            lastFill: fill,
+            lastDropAt: Date.now(),
+            reactivated: false,
+        };
+    }
+
+    /**
+     * Detect Pulse not consuming: unread fill rises (or never drops) while we
+     * stay pinned active — classic tetrapol "frozen" seat monopolizing the FIFO.
+     */
+    maybeReleaseStuckActive() {
+        if (!this.globalActive || this._busy || this._userHold) return;
+        const age = Date.now() - (this._activeSinceMs || 0);
+        if (age < STUCK_FILL_GRACE_MS) return;
+
+        const pe = this._snap[this.globalActive.source] || {};
+        if (!pe.exclusive) return;
+        const meta = this.groupMeta(pe, this.globalActive.id);
+        const fill = Number(meta.fill_ratio);
+        const curFill = Number.isFinite(fill) ? fill : 0;
+        const wantKey = keyOf(this.globalActive.source, this.globalActive.id);
+
+        if (!this._fillWatch || this._fillWatch.key !== wantKey) {
+            this.resetFillWatch(curFill);
+            return;
+        }
+        const watch = this._fillWatch;
+        if (curFill < watch.lastFill - 0.01) {
+            watch.lastFill = curFill;
+            watch.lastDropAt = Date.now();
+            return;
+        }
+        if (curFill > watch.lastFill) watch.lastFill = curFill;
+
+        const noDropMs = Date.now() - (watch.lastDropAt || 0);
+        const rise = watch.lastFill - (watch.fillAtGrant || 0);
+        const risingStuck = noDropMs >= STUCK_FILL_MS && rise >= STUCK_FILL_RISE;
+        const flatStuck = noDropMs >= STUCK_FLAT_MS
+            && watch.lastFill >= STUCK_FLAT_MIN_FILL
+            && rise >= -0.005;
+        if (!risingStuck && !flatStuck) return;
+
+        const ended = { ...this.globalActive, fill_ratio: curFill };
+        // First strike: re-assert activate (corked / missed play command).
+        if (!watch.reactivated) {
+            watch.reactivated = true;
+            watch.fillAtGrant = curFill;
+            watch.lastFill = curFill;
+            watch.lastDropAt = Date.now();
+            this.log('stuck-fill → re-activate', this.fmtSlot(ended),
+                `rise=${Math.round(rise * 100)}% no_drop_ms=${noDropMs}`);
+            this.enqueueCommand(async () => {
+                if (!this.globalActive
+                    || keyOf(this.globalActive.source, this.globalActive.id) !== wantKey) {
+                    return;
+                }
+                this._activeSinceMs = Date.now();
+                await this.activate(this.globalActive);
+            });
+            return;
+        }
+
+        this.log('stuck-fill → release', this.fmtSlot(ended),
+            `rise=${Math.round(rise * 100)}% no_drop_ms=${noDropMs}`,
+            `| queue=${this.queueSummary()}`);
+        this.enqueueCommand(async () => {
+            this._busy = true;
+            try {
+                if (!this.globalActive
+                    || keyOf(this.globalActive.source, this.globalActive.id) !== wantKey) {
+                    return;
+                }
+                const src = ended.source;
+                this.removeFromQueue(ended);
+                this.noteStuckBan(src, ended.id);
+                this.globalActive = null;
+                this._activeSinceMs = 0;
+                this._fillWatch = null;
+                await this.yieldSource(src, ended.id);
+                if (!this._userHold) await this.promoteNext();
+                this.notifyChange();
+            } finally {
+                this._busy = false;
+            }
+        });
+    }
+
     /**
      * Monitor lancé après coup : les projets ont déjà un actif Pulse local.
      * L'adopter au lieu de le traiter comme un waiter (sinon yield + silence).
      * S'il y a déjà une ★ en file, on laisse promoteNext la grant.
+     *
+     * Important: never adopt drained / just-yielded ids (stale WS), and always
+     * re-assert activate so the peer project is yielded (otherwise both play).
      */
     adoptLocalActivesIfIdle() {
-        if (this.globalActive) return false;
+        if (this.globalActive || this._userHold) return false;
         if (this.globalQueue.some((s) => s.priority)) return false;
         const locals = [];
         for (const source of ['airband', 'tetrapol']) {
@@ -293,7 +506,10 @@ class PulseArbiter {
             if (pe.exclusive === false) continue;
             const id = pe.active_group_id ? String(pe.active_group_id) : '';
             if (!id) continue;
+            if (this.isYieldGuarded(source, id)) continue;
             const meta = this.groupMeta(pe, id);
+            // Stale active_group_id after eof/yield must not become a ghost active.
+            if (!this.hasBufferedAudio(meta)) continue;
             locals.push({
                 source,
                 id,
@@ -304,6 +520,7 @@ class PulseArbiter {
         if (!locals.length) return false;
         locals.sort((a, b) => (b.priority ? 1 : 0) - (a.priority ? 1 : 0));
         const slot = locals[0];
+        const peers = locals.slice(1);
         this.removeFromQueue(slot);
         this.globalActive = {
             source: slot.source,
@@ -313,9 +530,28 @@ class PulseArbiter {
         };
         this._activeSinceMs = Date.now();
         this._drainedTicks = 0;
+        this.resetFillWatch(slot.fill_ratio);
         this.log('adopt local active (late monitor)', this.fmtSlot(this.globalActive),
-            `| queue=${this.queueSummary()}`);
+            `| queue=${this.queueSummary()}`
+            + (peers.length ? ` peers=${peers.map((p) => this.fmtSlot(p)).join(',')}` : ''));
         this.notifyChange();
+        // Re-assert play + yield any other local actives (dual-project race).
+        this.enqueueCommand(async () => {
+            this._busy = true;
+            try {
+                if (!this.globalActive
+                    || keyOf(this.globalActive.source, this.globalActive.id) !== keyOf(slot.source, slot.id)) {
+                    return;
+                }
+                await this.activate(slot);
+                for (const peer of peers) {
+                    this.log('adopt → yield peer', this.fmtSlot(peer));
+                    await this.yieldSource(peer.source, peer.id);
+                }
+            } finally {
+                this._busy = false;
+            }
+        });
         return true;
     }
 
@@ -341,12 +577,13 @@ class PulseArbiter {
             const k = keyOf(source, gid);
             if (seen.has(k)) return;
             if (candidates.some((c) => keyOf(c.source, c.id) === k)) return;
-            if (!this.hasPlayableAudio(g)) return;
+            if (!this.hasBufferedAudio(g)) return;
             // Skip project's current active if it matches our commanded active.
             if (this.globalActive
                 && keyOf(this.globalActive.source, this.globalActive.id) === k) {
                 return;
             }
+            if (this.isStuckBanned(source, gid)) return;
             const fill = Number(g.fill_ratio);
             candidates.push({
                 source,
@@ -362,7 +599,7 @@ class PulseArbiter {
         for (const source of ['airband', 'tetrapol']) {
             const pe = this._snap[source] || {};
             if (pe.exclusive === false) continue;
-            if (this._sourceConnected[source] === false) continue;
+            if (this.sourceAbsent(source)) continue;
             // queue_order first — preserves project FIFO before listen_groups extras.
             const order = Array.isArray(pe.queue_order) ? pe.queue_order : [];
             for (const rawId of order) {
@@ -449,7 +686,7 @@ class PulseArbiter {
                 this.removeFromQueue(ended);
                 this.globalActive = null;
                 this._activeSinceMs = 0;
-                await this.yieldSource(src);
+                await this.yieldSource(src, ended.id);
                 await this.promoteNext();
                 this.notifyChange();
             });
@@ -623,7 +860,7 @@ class PulseArbiter {
      * current active once it is quiet and unread < 80 %.
      */
     maybeForcePromote() {
-        if (this._busy || !this.isForceBeforeFullEnabled()) return;
+        if (this._userHold || this._busy || !this.isForceBeforeFullEnabled()) return;
         const candidate = this.findForcePromoteCandidate();
         if (!candidate) return;
 
@@ -644,6 +881,7 @@ class PulseArbiter {
                     };
                     this._activeSinceMs = Date.now();
                     this._drainedTicks = 0;
+                    this.resetFillWatch(c.fill_ratio);
                     this.log('force-promote → GRANT (idle)', this.fmtSlot(c));
                     await this.activate(c);
                     this.notifyChange();
@@ -705,7 +943,8 @@ class PulseArbiter {
         };
         this._activeSinceMs = Date.now();
         this._drainedTicks = 0;
-        await this.yieldSource(active.source);
+        this.resetFillWatch(slot.fill_ratio);
+        await this.yieldSource(active.source, active.id);
         await this.activate(slot);
         this.notifyChange();
     }
@@ -715,7 +954,8 @@ class PulseArbiter {
      * Tetrapol/Airband local preempt when monitor owns the FIFO.
      */
     maybePriorityPreempt() {
-        if (!this.globalActive || this._busy) return;
+        if (this._userHold || !this.globalActive || this._busy) return;
+        if (this._forceShieldUntil > Date.now()) return;
         this.reorderQueueByPriority();
         const active = {
             ...this.globalActive,
@@ -727,8 +967,13 @@ class PulseArbiter {
         let waiter = null;
         for (const s of this.globalQueue) {
             if (!s.priority) continue;
+            if (this.isStuckBanned(s.source, s.id)) continue;
             const meta = this.groupMeta(this._snap[s.source] || {}, s.id);
-            if (!this.hasPlayableAudio(meta)) continue;
+            // Require real buffered PCM — hollow ★ seats (fill≈0) must not steal.
+            if (!this.hasBufferedAudio(meta)) continue;
+            const fill = Number(meta.fill_ratio) || 0;
+            const buf = Number(meta.buffer_seconds) || 0;
+            if (fill < 0.02 && buf < 0.15) continue;
             waiter = { ...s, ...meta, priority: true };
             break;
         }
@@ -744,6 +989,7 @@ class PulseArbiter {
                         !== keyOf(victim.source, victim.id)) {
                     return;
                 }
+                if (this._forceShieldUntil > Date.now()) return;
                 const cur = {
                     ...this.globalActive,
                     ...this.groupMeta(this._snap[this.globalActive.source] || {}, this.globalActive.id),
@@ -752,7 +998,8 @@ class PulseArbiter {
                 if (cur.priority || !this.canPreemptActive(cur, { priorityPreempt: true })) return;
                 const meta = this.groupMeta(this._snap[target.source] || {}, target.id);
                 if (!(target.priority || meta.priority)) return;
-                if (!this.hasPlayableAudio(meta)) return;
+                if (this.isStuckBanned(target.source, target.id)) return;
+                if (!this.hasBufferedAudio(meta)) return;
 
                 await this.preemptActiveWith(
                     { ...target, ...meta, priority: true },
@@ -819,54 +1066,99 @@ class PulseArbiter {
         return '[' + this.globalQueue.map((s) => this.fmtSlot(s)).join(' → ') + ']';
     }
 
+    /** WS down or HTTP command channel dead — treat the project as not running. */
+    sourceAbsent(source) {
+        return this._sourceConnected[source] === false || this._httpDown[source] === true;
+    }
+
+    noteHttpDown(source, err) {
+        const already = this._httpDown[source] === true;
+        this._httpDown[source] = true;
+        if (!this._sourceDownSinceMs[source]) this._sourceDownSinceMs[source] = Date.now();
+        if (already) return;
+        const label = source === 'tetrapol' ? 'TP' : 'AB';
+        const msg = err && err.message ? err.message : err;
+        this.log('source down (ignored, keep probing)', label, msg);
+        this.globalQueue = this.globalQueue.filter((s) => s.source !== source);
+    }
+
+    noteHttpUp(source) {
+        if (this._httpDown[source] !== true) return;
+        this._httpDown[source] = false;
+        if (this._sourceConnected[source] !== false) this._sourceDownSinceMs[source] = 0;
+        this.log('source up', source === 'tetrapol' ? 'TP' : 'AB');
+    }
+
     /**
      * POST to a project. Heartbeats are silent; other commands log at call sites.
+     * A refused or timed-out peer returns null and is ignored — it must not reject
+     * the command queue (that used to abort the other project's play/yield).
+     * Heartbeats still go out so a restarted project is picked up again.
      */
     async post(source, body, { silent = false } = {}) {
         const base = source === 'tetrapol' ? this.tetrapolBase : this.airbandBase;
         const isHb = !!(body && body.monitor_heartbeat);
+        if (!isHb && this.sourceAbsent(source)) return null;
         if (!silent && !isHb) {
             this.log('POST', source, body);
         }
-        return postJson(base, '/api/pulse-exclusive', body);
-    }
-
-    async yieldSource(source) {
-        this.log('yield', source === 'tetrapol' ? 'TP' : 'AB',
-            `| active=${this.fmtSlot(this.globalActive)} queue=${this.queueSummary()}`);
-        if (source === 'airband') {
-            await this.post('airband', { yield_active: true, manual_hold: true }, { silent: true });
-        } else {
-            await this.post('tetrapol', {
-                yield_active: true,
-                active_group_id: '',
-                manual_hold: true,
-            }, { silent: true });
+        try {
+            const res = await postJson(base, '/api/pulse-exclusive', body, COMMAND_TIMEOUT_MS);
+            this.noteHttpUp(source);
+            return res;
+        } catch (err) {
+            if (!isTransportError(err)) throw err;
+            this.noteHttpDown(source, err);
+            return null;
         }
     }
 
+    /** @returns {Promise<boolean>} false when the project is absent or did not answer. */
+    async yieldSource(source, idHint) {
+        const fromActive = this.globalActive && this.globalActive.source === source
+            ? this.globalActive.id
+            : '';
+        const fromSnap = (this._snap[source] || {}).active_group_id || '';
+        const pinnedId = idHint || fromActive || fromSnap;
+        if (pinnedId) this.noteYieldGuard(source, pinnedId);
+        if (this.sourceAbsent(source)) return false;
+        this.log('yield', source === 'tetrapol' ? 'TP' : 'AB',
+            `| active=${this.fmtSlot(this.globalActive)} queue=${this.queueSummary()}`);
+        const body = source === 'airband'
+            ? { yield_active: true, manual_hold: true }
+            : { yield_active: true, active_group_id: '', manual_hold: true };
+        const res = await this.post(source, body, { silent: true });
+        return res != null;
+    }
+
+    /** @returns {Promise<boolean>} false when this project itself did not accept play. */
     async activate(slot) {
-        if (!slot) return;
+        if (!slot) return false;
         this.log('promote/activate', this.fmtSlot(slot),
             `| queue=${this.queueSummary()}`);
-        // Clear peer first so Tetrapol/Airband do not briefly fight, then grant.
+        // Yield the peer when it answers. A dead peer is "not launched": skip it
+        // so this project's Pulse playback is not stuck behind ECONNREFUSED.
         await this.ensureOtherHeldEmpty(slot.source);
-        await this.post(slot.source, {
+        if (this.sourceAbsent(slot.source)) return false;
+        const res = await this.post(slot.source, {
             active_group_id: String(slot.id),
             manual_hold: true,
         }, { silent: true });
+        return res != null;
     }
 
     async ensureOtherHeldEmpty(activeSource) {
         const other = activeSource === 'airband' ? 'tetrapol' : 'airband';
+        if (this.sourceAbsent(other)) return true;
         const pe = this._snap[other] || {};
-        // Only clear a foreign active — do NOT force manual_hold on the peer.
-        if (pe.active_group_id) {
-            this.log('peer-busy → yield', other, `#${pe.active_group_id}`);
-            await this.yieldSource(other);
-            return true;
+        const peerId = pe.active_group_id ? String(pe.active_group_id) : '';
+        if (peerId) {
+            this.log('peer-busy → yield', other, `#${peerId}`);
+        } else {
+            this.log('peer-yield (force)', other === 'tetrapol' ? 'TP' : 'AB');
         }
-        return false;
+        await this.yieldSource(other, peerId || undefined);
+        return true;
     }
 
     async sendHeartbeats() {
@@ -890,25 +1182,57 @@ class PulseArbiter {
     }
 
     async promoteNext() {
-        // Refresh from project telemetry, drop hollow fill=0% seats first.
+        if (this._userHold) {
+            this.log('promoteNext skip (user hold)', `| queue=${this.queueSummary()}`);
+            return false;
+        }
+        // Refresh from project telemetry, drop dead hollow seats first.
         this.syncWaitersFromTelemetry();
         this.reorderQueueByPriority();
         this.pullSaturatedWaiterForward();
         while (this.globalQueue.length) {
-            const next = this.globalQueue.shift();
+            const next = this.globalQueue[0];
             if (!next) break;
             const pe = this._snap[next.source] || {};
             if (pe.exclusive === false) {
                 this.log('promoteNext skip (exclusive off)', this.fmtSlot(next));
+                this.globalQueue.shift();
+                continue;
+            }
+            if (this.isStuckBanned(next.source, next.id)) {
+                this.log('promoteNext skip (stuck ban)', this.fmtSlot(next));
+                this.globalQueue.shift();
+                continue;
+            }
+            if (this.sourceAbsent(next.source)) {
+                this.log('promoteNext skip (source down)', this.fmtSlot(next));
+                this.globalQueue.shift();
                 continue;
             }
             const meta = this.groupMeta(pe, next.id);
-            if (!this.hasPlayableAudio(meta)) {
+            // FIFO: head still live but empty → wait for PCM, do not activate silence
+            // (that used to yield the peer and leave both weird / dual audio).
+            if (!this.hasBufferedAudio(meta)) {
+                if (meta.on_air || meta.suspended) {
+                    // Avoid log spam while waiting for first PCM on FIFO head.
+                    const waitKey = keyOf(next.source, next.id);
+                    if (this._promoteWaitLogKey !== waitKey) {
+                        this._promoteWaitLogKey = waitKey;
+                        this.log('promoteNext wait (head live, no PCM yet)',
+                            this.fmtSlot({ ...next, ...meta }),
+                            `| queue=${this.queueSummary()}`);
+                    }
+                    return false;
+                }
+                this._promoteWaitLogKey = '';
                 this.log('promoteNext skip (empty/no audio)', this.fmtSlot({ ...next, ...meta }),
                     `| remaining=${this.queueSummary()}`);
+                this.globalQueue.shift();
                 continue;
             }
+            this._promoteWaitLogKey = '';
 
+            this.globalQueue.shift();
             this.globalActive = {
                 source: next.source,
                 id: next.id,
@@ -919,14 +1243,25 @@ class PulseArbiter {
             };
             this._activeSinceMs = Date.now();
             this._drainedTicks = 0;
+            this.resetFillWatch(meta.fill_ratio);
             this.log('promoteNext →', this.fmtSlot(this.globalActive),
                 `| remaining=${this.queueSummary()}`);
-            await this.activate({ ...next, ...meta });
+            const commanded = await this.activate({ ...next, ...meta });
+            if (!commanded) {
+                this.log('promoteNext abort (source down)', this.fmtSlot(next),
+                    `| remaining=${this.queueSummary()}`);
+                this.globalActive = null;
+                this._activeSinceMs = 0;
+                this._fillWatch = null;
+                continue;
+            }
             return true;
         }
         this.log('promoteNext → idle (queue empty)');
         this.globalActive = null;
         this._activeSinceMs = 0;
+        // Keep project manual_hold under arbiter authority (prevents local dual play).
+        // UI « MANUEL » uses user_hold only — do not clear holds just because idle.
         return false;
     }
 
@@ -965,6 +1300,37 @@ class PulseArbiter {
         return this.enqueueCommand(async () => {
             this._busy = true;
             try {
+                // UI Pause / manuel : pas de nouveau grant, sauf si c'est déjà
+                // l'actif forcé (▶) — sinon un claim projet coupe la lecture.
+                if (this._userHold) {
+                    if (this.globalActive
+                        && keyOf(this.globalActive.source, this.globalActive.id) === keyOf(source, id)) {
+                        this.log('claim → re-assert play (user hold)', this.fmtSlot(slot));
+                        await this.activate(slot);
+                        return {
+                            ok: true,
+                            granted: true,
+                            action: 'play',
+                            active: { ...this.globalActive },
+                            arbiter: this.snapshot(),
+                        };
+                    }
+                    this.enqueue(slot, { front: false });
+                    if (String((this._snap[source] || {}).active_group_id || '') === id) {
+                        await this.yieldSource(source, id);
+                    }
+                    this.log('claim → WAIT (user hold)', this.fmtSlot(slot),
+                        `| queue=${this.queueSummary()}`);
+                    this.notifyChange();
+                    return {
+                        ok: true,
+                        granted: false,
+                        action: 'wait',
+                        active: null,
+                        arbiter: this.snapshot(),
+                    };
+                }
+
                 // Already the global active.
                 if (this.globalActive
                     && keyOf(this.globalActive.source, this.globalActive.id) === keyOf(source, id)) {
@@ -989,6 +1355,7 @@ class PulseArbiter {
                     };
                     this._activeSinceMs = Date.now();
                     this._drainedTicks = 0;
+                    this.resetFillWatch(slot.fill_ratio);
                     this.log('claim → GRANT (idle)', this.fmtSlot(slot));
                     await this.activate(slot);
                     this.notifyChange();
@@ -1009,6 +1376,8 @@ class PulseArbiter {
 
                 // Priority preempts non-priority if active can yield (< 80 %, quiet).
                 if (slot.priority && !active.priority
+                    && !this.isStuckBanned(source, id)
+                    && !(this._forceShieldUntil > Date.now())
                     && this.canPreemptActive(active, { priorityPreempt: true })) {
                     this.log('claim → PREEMPT', this.fmtSlot(slot),
                         `over ${this.fmtSlot(active)}`);
@@ -1057,7 +1426,7 @@ class PulseArbiter {
                 this.enqueue(slot, { front: false });
                 // Ensure claimant is not spontaneously playing.
                 if (String((this._snap[source] || {}).active_group_id || '') === id) {
-                    await this.yieldSource(source);
+                    await this.yieldSource(source, id);
                 }
                 this.notifyChange();
                 return {
@@ -1104,7 +1473,7 @@ class PulseArbiter {
                     this.removeFromQueue(slot);
                     this.globalActive = null;
                     this._activeSinceMs = 0;
-                    await this.yieldSource(source);
+                    await this.yieldSource(source, id);
                     // Rebuild FIFO from project telemetry (claims may have lagged).
                     this.syncWaitersFromTelemetry(excludeEnded);
                     await this.promoteNext();
@@ -1158,11 +1527,16 @@ class PulseArbiter {
             this._busy = true;
             try {
                 const want = keyOf(source, id);
+                // ▶ sort du mode Pause / MANUEL et force ce canal (file auto ensuite).
+                // Shield against ★ prio-preempt so the click is not undone in <1s.
+                this._userHold = false;
+                this._forceShieldUntil = Date.now() + FORCE_PLAY_SHIELD_MS;
+                this._stuckBanUntil.delete(want);
                 this.log('forcePlay', this.fmtSlot(slot),
                     `| was=${this.fmtSlot(this.globalActive)}`);
                 if (this.globalActive && keyOf(this.globalActive.source, this.globalActive.id) !== want) {
                     this.enqueue(this.globalActive, { front: true });
-                    await this.yieldSource(this.globalActive.source);
+                    await this.yieldSource(this.globalActive.source, this.globalActive.id);
                 }
                 this.removeFromQueue(slot);
                 this.globalActive = {
@@ -1172,6 +1546,7 @@ class PulseArbiter {
                 };
                 this._activeSinceMs = Date.now();
                 this._drainedTicks = 0;
+                this.resetFillWatch(slot.fill_ratio);
                 await this.activate(slot);
                 this.notifyChange();
                 return {
@@ -1187,16 +1562,19 @@ class PulseArbiter {
         });
     }
 
-    /** UI « ⏹ Stop » : yield active, do not auto-promote. */
-    async stopActive() {
+    /** UI « ⏸ Pause » : yield active, do not auto-promote until « Auto ». */
+    async pauseActive() {
         return this.enqueueCommand(async () => {
             this._busy = true;
             try {
-                this.log('stop', this.fmtSlot(this.globalActive), `| queue=${this.queueSummary()}`);
+                this._userHold = true;
+                this.log('pause', this.fmtSlot(this.globalActive), `| queue=${this.queueSummary()}`);
                 if (this.globalActive) {
-                    const src = this.globalActive.source;
+                    const ended = { ...this.globalActive };
+                    this.enqueue(ended, { front: true });
                     this.globalActive = null;
-                    await this.yieldSource(src);
+                    this._activeSinceMs = 0;
+                    await this.yieldSource(ended.source, ended.id);
                 }
                 await Promise.allSettled([
                     this.post('airband', { stop_active: true, manual_hold: true }, { silent: true }),
@@ -1214,11 +1592,65 @@ class PulseArbiter {
         });
     }
 
+    /** UI « ⏹ Stop » : disable listen on the playing group, then auto-promote. */
+    async disableActive() {
+        return this.enqueueCommand(async () => {
+            this._busy = true;
+            try {
+                const ended = this.globalActive ? { ...this.globalActive } : null;
+                this.log('disable/stop', this.fmtSlot(ended), `| queue=${this.queueSummary()}`);
+                if (ended) {
+                    this.removeFromQueue(ended);
+                    this.globalActive = null;
+                    this._activeSinceMs = 0;
+                    this.noteYieldGuard(ended.source, ended.id);
+                    await this.disableListen(ended.source, ended.id);
+                    await this.yieldSource(ended.source, ended.id);
+                    this.syncWaitersFromTelemetry({
+                        excludeKeys: new Set([keyOf(ended.source, ended.id)]),
+                    });
+                }
+                if (!this._userHold) {
+                    await this.promoteNext();
+                }
+                this.notifyChange();
+                return { ok: true, arbiter: this.snapshot() };
+            } finally {
+                this._busy = false;
+            }
+        });
+    }
+
+    async disableListen(source, id) {
+        if (!id) return;
+        const base = source === 'tetrapol' ? this.tetrapolBase : this.airbandBase;
+        this.log('disable listen', source === 'tetrapol' ? 'TP' : 'AB', `#${id}`);
+        if (this.sourceAbsent(source)) return;
+        try {
+            await postJson(
+                base,
+                `/api/toggle?group=${encodeURIComponent(String(id))}&listen=false`,
+                {},
+                COMMAND_TIMEOUT_MS
+            );
+            this.noteHttpUp(source);
+        } catch (err) {
+            if (isTransportError(err)) this.noteHttpDown(source, err);
+            else this.log('disable listen failed', err && err.message ? err.message : err);
+        }
+    }
+
+    /** @deprecated alias — Pause UI */
+    async stopActive() {
+        return this.pauseActive();
+    }
+
     /** UI « ↻ Auto » : clear holds and promote next waiter if nothing active. */
     async resumeAuto() {
         return this.enqueueCommand(async () => {
             this._busy = true;
             try {
+                this._userHold = false;
                 this.log('auto', `| active=${this.fmtSlot(this.globalActive)} queue=${this.queueSummary()}`);
                 await Promise.allSettled([
                     this.post('airband', { manual_hold: false }, { silent: true }),

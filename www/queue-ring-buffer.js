@@ -100,13 +100,14 @@ export class AudioRingBuffer {
 
     /**
      * on_air ↑ : recommencer à stocker tout de suite, sans attendre un StreamTitle.
-     * Pendant la grâce : annuler (l'audio de marge reste sous l'ancien titre) et
-     * ancrer une reprise à l'offset courant. Pendant inBlank : flush 1 s / marqueur.
+     * Marqueur liveResume vide = parole sans label (pas l'ancien talker).
+     * Le StreamTitle ICY remplira le marqueur ; tant qu'il n'arrive pas → rien.
      */
     _resumeFromLiveSpeech() {
         if (this.awaitingFirstTitle) return false;
         if (this.blankGraceActive) {
             this._cancelBlankGrace();
+            this.lastTitle = '';
             this.titleChanges.push({
                 byteOffset: this.totalBytesWritten,
                 title: '',
@@ -206,7 +207,14 @@ export class AudioRingBuffer {
     }
 
     _handleBlankAudio(chunk) {
-        // Après la grâce : encore blankStoreSec écrits, puis drop + preRoll 1 s.
+        // Carte active : continuer à stocker jusqu'à la fin du hold 7 s
+        // (sinon la lecture s'arrête pendant « En attente »).
+        if (!this._playbackPaused) {
+            this._store(chunk);
+            this._updateOpenBlankMarker();
+            return;
+        }
+        // File : encore blankStoreSec écrits, puis drop + preRoll 1 s.
         if (this.blankTailRemaining > 0) {
             const take = Math.min(chunk.length, this.blankTailRemaining);
             const before = this.totalBytesWritten;
@@ -214,7 +222,6 @@ export class AudioRingBuffer {
             const stored = this.totalBytesWritten - before;
             this.blankTailRemaining = Math.max(0, this.blankTailRemaining - stored);
             if (stored < take) {
-                // Tampon plein : le reste n'est plus stocké.
                 this.blankTailRemaining = 0;
                 this._dropBlankChunk(chunk.subarray(stored));
             } else if (take < chunk.length) {
@@ -518,6 +525,8 @@ export class AudioRingBuffer {
         this.inBlank = false;
         this.blankTailRemaining = 0;
         const labeled = String(title || '').trim();
+        // Reprise sans ICY : lastTitle vide → pas d'affichage de l'ancien talker.
+        this.lastTitle = labeled;
         if (wasStoringTail) {
             this.preRoll = [];
             this.preRollBytes = 0;
@@ -596,9 +605,8 @@ export class AudioRingBuffer {
     _entryIsSpeech(e) {
         if (!e) return false;
         if (String(e.title || '').trim()) return true;
-        // Reprise on_air : parole seulement s'il y a un vrai label (ICY ou lastTitle).
-        if (e.liveResume && String(this.lastTitle || '').trim()) return true;
-        return false;
+        // liveResume vide = parole en cours sans StreamTitle encore (pas un blanc).
+        return !!e.liveResume;
     }
 
     isBlankAtByte(bytePos) {
@@ -608,20 +616,23 @@ export class AudioRingBuffer {
         return !String(e.title || '').trim();
     }
 
-    /** Label à afficher à bytePos (reprise on_air sans titre sur le marqueur). */
+    /**
+     * Label ICY à bytePos uniquement.
+     * liveResume vide → rien (pas lastTitle / ancien talker).
+     */
     displayTitleAtByte(bytePos) {
         const e = this._markerAtByte(bytePos);
-        if (!e) return String(this.lastTitle || '').trim();
+        if (!e) return '';
         const own = String(e.title || '').trim();
         if (own) return own;
         if (!e.liveResume) return '';
         for (const n of this.titleChanges) {
-            if (n.byteOffset >= e.byteOffset) {
+            if (n.byteOffset > e.byteOffset) {
                 const t = String(n.title || '').trim();
                 if (t) return t;
             }
         }
-        return String(this.lastTitle || '').trim();
+        return '';
     }
 
     /** Infos sur le blanc couvrant bytePos (durée sautée à l'ingest, etc.). */
