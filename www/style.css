@@ -438,6 +438,14 @@ tr:hover {
     min-height: 1.2em;
 }
 
+.stream-card-rfsi {
+    font-size: 0.85em;
+    color: #bbb;
+    line-height: 1.2;
+    font-weight: 500;
+    word-break: break-word;
+}
+
 .stream-card-zone-label,
 .stream-metadata {
     flex: 0 0 auto;

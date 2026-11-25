@@ -413,7 +413,44 @@
         return parts.length >= 2 && parts[1] ? String(parts[1]) : null;
     }
 
-    /** Réseau Tetrapol d'un groupe (via RFSI des canaux on_air / connus). */
+    /**
+     * StreamTitle ICY : "Label|130-2-20-123" (nouveau) ou label/RFSI seul (ancien).
+     * Compatible avec et sans partie RFSI.
+     */
+    function parseIcyStreamTitle(raw) {
+        const text = String(raw ?? '').trim();
+        if (!text) return { label: '', rfsi: '', display: '' };
+
+        const pipe = text.lastIndexOf('|');
+        if (pipe >= 0) {
+            const maybeRfsi = text.slice(pipe + 1).trim();
+            const label = text.slice(0, pipe).trim();
+            if (maybeRfsi && extractNetworkId(maybeRfsi)) {
+                return {
+                    label: label || maybeRfsi,
+                    rfsi: maybeRfsi,
+                    display: label || maybeRfsi,
+                };
+            }
+        }
+
+        const nid = extractNetworkId(text);
+        if (nid) return { label: text, rfsi: text, display: text };
+        return { label: text, rfsi: '', display: text };
+    }
+
+    /** Dernier réseau stream vu par groupe (RFSI canal ou ICY Label|RFSI). */
+    const groupStreamNetworkIds = Object.create(null);
+
+    function rememberGroupStreamNetwork(groupId, text) {
+        const gid = String(groupId || '');
+        const parsed = parseIcyStreamTitle(text);
+        const nid = extractNetworkId(parsed.rfsi || text);
+        if (!gid || !nid) return;
+        groupStreamNetworkIds[gid] = String(nid);
+    }
+
+    /** Réseau Tetrapol d'un groupe (via RFSI des canaux on_air / connus / ICY). */
     function networkIdForGroup(groupId) {
         const gid = String(groupId);
         let fallback = null;
@@ -421,10 +458,12 @@
             if (String(c.group_id) !== gid || !c.rfsi) continue;
             const nid = extractNetworkId(c.rfsi);
             if (!nid) continue;
+            rememberGroupStreamNetwork(gid, c.rfsi);
             if (c.on_air) return nid;
             if (!fallback) fallback = nid;
         }
-        return fallback;
+        if (fallback) return fallback;
+        return groupStreamNetworkIds[gid] || null;
     }
 
     function deviceIdForEntry(entry) {
@@ -713,10 +752,15 @@
             </div>`;
         }
         const group = tetrapolCardGroupLabel(entry, frozenGroupLabel);
-        const streamTitle = (txTitle || '').trim();
+        const parsed = parseIcyStreamTitle(txTitle);
+        const streamTitle = parsed.display || '';
+        const rfsiLine = (parsed.rfsi && parsed.rfsi !== parsed.label)
+            ? `<div class="stream-card-rfsi">${parsed.rfsi}</div>`
+            : '';
         return `<div class="stream-card-header stream-card-zone stream-card-zone-name stream-card-header-tetrapol">
             <div class="stream-card-source">${src}</div>
             <div class="stream-card-title">${streamTitle || '\u00a0'}</div>
+            ${rfsiLine}
             <div class="stream-card-subtitle stream-card-group-label">${group}</div>
         </div>`;
     }
@@ -755,16 +799,41 @@
         } else {
             header.classList.add('stream-card-header-tetrapol');
             const group = tetrapolCardGroupLabel(entry, opts.groupLabel);
-            const streamTitle = (opts.txTitle || '').trim();
+            const parsed = parseIcyStreamTitle(opts.txTitle);
+            const streamTitle = parsed.display || '';
             if (titleEl) titleEl.textContent = streamTitle || '\u00a0';
-            if (subEl) {
-                subEl.textContent = group;
-                subEl.classList.add('stream-card-group-label');
+
+            let rfsiEl = header.querySelector('.stream-card-rfsi');
+            const showRfsi = !!(parsed.rfsi && parsed.rfsi !== parsed.label);
+            if (showRfsi) {
+                if (!rfsiEl) {
+                    rfsiEl = document.createElement('div');
+                    rfsiEl.className = 'stream-card-rfsi';
+                    const after = titleEl || header.querySelector('.stream-card-source');
+                    if (after && after.nextSibling) header.insertBefore(rfsiEl, after.nextSibling);
+                    else header.appendChild(rfsiEl);
+                }
+                rfsiEl.textContent = parsed.rfsi;
+            } else if (rfsiEl) {
+                rfsiEl.remove();
+            }
+
+            // Re-resolve subtitle after possible RFSI insert.
+            const groupEl = header.querySelector('.stream-card-group-label')
+                || header.querySelector('.stream-card-subtitle');
+            if (groupEl) {
+                groupEl.textContent = group;
+                groupEl.classList.add('stream-card-subtitle', 'stream-card-group-label');
             } else {
                 const s = document.createElement('div');
                 s.className = 'stream-card-subtitle stream-card-group-label';
                 s.textContent = group;
                 header.appendChild(s);
+            }
+
+            if (opts.txTitle) {
+                const gid = entry && entry.rawId != null ? entry.rawId : null;
+                if (gid != null) rememberGroupStreamNetwork(gid, opts.txTitle);
             }
         }
     }
@@ -2037,6 +2106,9 @@
         tetrapolGroups.forEach((_g, gid) => {
             if (networkIdForGroup(gid) === id) gids.add(String(gid));
         });
+        Object.keys(groupStreamNetworkIds).forEach((gid) => {
+            if (groupStreamNetworkIds[gid] === id) gids.add(String(gid));
+        });
         return [...gids];
     }
 
@@ -2427,22 +2499,41 @@
         return true;
     }
 
+    /** Vrai StreamTitle ICY déjà vu dans le ring (Label|RFSI ou RFSI / label). */
+    function ringHadRealIcyTitle(seg) {
+        const rb = seg?.ringBuffer;
+        if (!rb) return false;
+        if (typeof rb.ringHasRealTitle === 'function') return !!rb.ringHasRealTitle();
+        if (rb._hadRealTitle) return true;
+        return (rb.titleChanges || []).some((e) => String(e.title || '').trim());
+    }
+
+    /**
+     * Tetrapol avec titre ICY réel : un blanc confirmé peut fermer la carte même si
+     * le listing reste on_air (TCH-only colle souvent après la fin de parole).
+     */
+    function tetrapolMayEndOnIcyBlank(key, seg) {
+        if (!key || !String(key).startsWith('tp:')) return false;
+        return ringHadRealIcyTitle(seg);
+    }
+
     function isBlockedAfterBlankClose(key) {
         if (!blankClosedOnAirGen.has(key)) return false;
-        // Canal / groupe déjà repris : ne pas bloquer une nouvelle carte.
-        if (tetrapolKeyIsOnAir(key)) {
-            blankClosedOnAirGen.delete(key);
-            return false;
-        }
-        return blankClosedOnAirGen.get(key) === (onAirGeneration.get(key) || 0);
+        const closedGen = blankClosedOnAirGen.get(key);
+        const curGen = onAirGeneration.get(key) || 0;
+        // Même génération : rester bloqué (fermeture ICY avec listing encore on_air,
+        // ou on_air↓ classique) jusqu'au prochain on_air↑ qui incrémente la gen.
+        if (closedGen === curGen) return true;
+        blankClosedOnAirGen.delete(key);
+        return false;
     }
 
     function stopEntryAfterBlank(key) {
-        // Groupe / canal encore on_air : une com non vide peut suivre le blanc ICY.
-        if (catalogKeyIsOnAir(key)) {
-            const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
-                || exclusiveQueue.find((s) => s.key === key)
-                || null;
+        const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
+            || exclusiveQueue.find((s) => s.key === key)
+            || null;
+        // Groupe / canal encore on_air : sauf Tetrapol déjà titré ICY (blanc = fin).
+        if (catalogKeyIsOnAir(key) && !tetrapolMayEndOnIcyBlank(key, liveSeg)) {
             if (liveSeg) {
                 debugStreamTitleLog('blank-close-skipped-on_air', {
                     key,
@@ -2453,9 +2544,6 @@
             }
             return;
         }
-        const liveSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
-            || exclusiveQueue.find((s) => s.key === key)
-            || null;
         if (liveSeg && ringHasLiveTalk(liveSeg)) {
             debugStreamTitleLog('blank-close-skipped-speech', {
                 key,
@@ -2828,12 +2916,13 @@
         if (blankTimers[key]) return;
         // Fenêtre post-on_air↑ : attendre un StreamTitle avant de relancer le hold 7 s.
         if (onAirTitleWaitTimers.has(key)) return;
-        // Listing encore actif : blanc ICY ≠ fin de com (airband surtout).
-        // force = on_air↓ explicite (listing déjà faux).
-        if (!opts.force && catalogKeyIsOnAir(key)) return;
         const holdSeg = (exclusiveActive?.key === key ? exclusiveActive : null)
             || exclusiveQueue.find(s => s.key === key)
             || null;
+        // Listing encore actif : blanc ICY ≠ fin de com (airband / TCH sans titre).
+        // Tetrapol déjà titré (Label|RFSI) : autoriser la fin même si on_air colle.
+        // force = on_air↓ explicite (listing déjà faux).
+        if (!opts.force && catalogKeyIsOnAir(key) && !tetrapolMayEndOnIcyBlank(key, holdSeg)) return;
         // force : listing on_air↓ alors que le ring a encore le talker ICY (pas de blanc stream).
         if (!opts.force) {
             if (holdSeg && playbackHasSpeech(holdSeg)) return;
@@ -3201,6 +3290,9 @@
 
         if (t) {
             lastNonEmptyStreamTitles[key] = t;
+            if (String(key || '').startsWith('tp:')) {
+                rememberGroupStreamNetwork(String(key).slice(3), t);
+            }
             cancelBlankCountdown(key);
             if (p) {
                 p.ending = false;
@@ -3761,6 +3853,9 @@
                 lastNonEmptyStreamTitles[seg.key] = title;
                 seg.ringLastTitle = title;
                 seg.analyzerConfirmedEnded = false;
+                if (String(seg.key || '').startsWith('tp:')) {
+                    rememberGroupStreamNetwork(String(seg.key).slice(3), title);
+                }
                 clearBlankHoldForSpeech(seg);
                 if (exclusiveActive === seg) {
                     maybeSkipBlankToNextTransmission(seg);
