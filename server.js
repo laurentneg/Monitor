@@ -145,6 +145,14 @@ app.post('/api/pulse/auto', async (req, res) => {
     }
 });
 
+// labels.json Tetrapol AVANT static (sinon mount /labels.json → req.url="/" → index.html)
+app.use('/labels.json', createProxyMiddleware({
+    target: CONFIG.tetrapolBase,
+    changeOrigin: true,
+    // Après app.use('/labels.json'), le path restant est "/" — forcer la ressource.
+    pathRewrite: () => '/labels.json',
+}));
+
 app.use(express.static(CONFIG.wwwRoot));
 
 function disableProxyBuffering(_proxyRes, _req, res) {

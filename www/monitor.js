@@ -87,6 +87,8 @@
     let pulsePriorityKeys = new Set(JSON.parse(localStorage.getItem('monitorPulsePriorityKeys') || '[]'));
     // Ignore Tetrapol priority echoes briefly after a local TP priority edit.
     let tpPulsePrioLocalUntil = 0;
+    // Ignore disabled_networks echoes briefly after a local network toggle.
+    let disabledNetworksLocalUntil = 0;
     let channelInactiveSince = {}; // channel_id -> ms when went inactive locally
     let channelWasOnAir = {};
     let inactiveRefreshTimer = null;
@@ -95,8 +97,8 @@
     let tetrapolGroups = new Map(); // group_id -> group info
     let tetrapolChannels = [];
     let tetrapolCells = new Map(); // channel_id -> cell sync state (from cell_info / cch_sync)
-    /** Cellules KO si aucun cell_info / snapshot frais (doit rester > fullSyncIntervalMs du bridge). */
-    const CELL_INFO_TIMEOUT_MS = 90000;
+    /** Cellules KO si aucun cell_info frais (aligné tetrapol-kit 25s ; > fullSyncIntervalMs bridge). */
+    const CELL_INFO_TIMEOUT_MS = 25000;
     let lastTetrapolCellFeedMs = 0;
     /** @type {Map<string, object>} unified playable entries by key */
     let catalog = new Map();
@@ -1059,11 +1061,12 @@
             const syncErrs = Number(raw.sync_errs) || 0;
             let syncStatus = normalizeCellSyncStatus(raw.sync_status, syncErrs);
             const rawLast = Number(raw.last_cell_info_ms) || 0;
-            // Prefer server timestamp; if synced without stamp, treat this live snapshot as a heartbeat.
+            // Comme tetrapol-kit : seuls cell_info / last_cell_info_ms comptent comme heartbeat.
+            // Ne JAMAIS traiter un snapshot « synced » comme un refresh (sinon reste vert à jamais).
             let lastCellInfoTime = rawLast
-                || (syncStatus === 'synced' ? now : 0)
                 || (prev && prev.lastCellInfoTime)
                 || 0;
+            // Ne pas remonter unsynced → synced via snapshot périmé
             if (prev && prev.syncStatus === 'unsynced' && syncStatus === 'synced') {
                 const age = lastCellInfoTime ? (now - lastCellInfoTime) : CELL_INFO_TIMEOUT_MS + 1;
                 if (age > CELL_INFO_TIMEOUT_MS) syncStatus = 'unsynced';
@@ -1087,7 +1090,7 @@
             if (!next.has(id)) next.set(id, prev);
         });
         tetrapolCells = next;
-        if (list.length) lastTetrapolCellFeedMs = now;
+        // Pas de lastTetrapolCellFeedMs ici : seul un vrai cell_info prouve que le CCH vit.
     }
 
     function handleTetrapolCellEvent(msg) {
@@ -1116,11 +1119,11 @@
             if (!Number.isFinite(channelId) || channelId <= 0) return true;
             let cell = tetrapolCells.get(channelId);
             if (!cell) {
-                cell = { channelId, syncStatus: 'unknown', syncErrs: 0, lastCellInfoTime: Date.now() };
-                tetrapolCells.set(channelId, cell);
+                // Comme tetrapol-kit : pas de cellule sans cell_info (évite faux vert).
+                return true;
             }
             const syncErrs = Number(msg.sync_errs) || 0;
-            // cch_sync does not refresh cell_info freshness (same as tetrapol-kit).
+            // cch_sync ne rafraîchit PAS lastCellInfoTime (sinon reste vert sans cell_info).
             if (cell.syncStatus !== 'unsynced') {
                 cell.syncStatus = normalizeCellSyncStatus(msg.status, syncErrs);
             }
@@ -2024,19 +2027,149 @@
         refreshAfterScopeChange();
     }
 
+    function tetrapolGroupIdsForNetwork(networkId) {
+        const id = String(networkId);
+        const gids = new Set();
+        tetrapolChannels.forEach((c) => {
+            if (!c.group_id || !c.rfsi) return;
+            if (extractNetworkId(c.rfsi) === id) gids.add(String(c.group_id));
+        });
+        tetrapolGroups.forEach((_g, gid) => {
+            if (networkIdForGroup(gid) === id) gids.add(String(gid));
+        });
+        return [...gids];
+    }
+
+    /** Aligne disabledNetworks sur le mixer (WS / monitor Python / autre client). */
+    function applyDisabledNetworksFromServer(rawList, opts = {}) {
+        if (!Array.isArray(rawList)) return false;
+        if (!opts.force && Date.now() < disabledNetworksLocalUntil) return false;
+        const serverNets = new Set(rawList.map(String).filter(Boolean));
+        const same = serverNets.size === disabledNetworks.size
+            && [...serverNets].every((id) => disabledNetworks.has(id));
+        if (same) {
+            disabledNetworksLocalUntil = 0;
+            return false;
+        }
+
+        const newlyDisabled = [...serverNets].filter((id) => !disabledNetworks.has(id));
+        disabledNetworks = serverNets;
+        newlyDisabled.forEach((id) => {
+            stopStreamsMatching((e) => {
+                if (e.source !== 'tetrapol') return false;
+                const nid = extractNetworkId(e.rfsi || e.meta && e.meta.rfsi)
+                    || networkIdForGroup(e.rawId);
+                return String(nid) === id;
+            });
+        });
+        saveDisabled();
+        lastScopeSig = '';
+        lastPulseSig = '';
+        refreshAfterScopeChange();
+        updatePulseNetworkButtons();
+        updatePulseAdmin();
+        return true;
+    }
+
     function toggleNetworkMonitoring(networkId) {
         const id = String(networkId);
+        // Réseaux = filtre RFSI uniquement (ne pas toucher listen des groupes Pulse).
         if (isNetworkEnabled(id)) {
             disabledNetworks.add(id);
             stopStreamsMatching((e) => {
                 if (e.source !== 'tetrapol') return false;
-                return networkIdForGroup(e.rawId) === id;
+                const nid = extractNetworkId(e.rfsi || e.meta && e.meta.rfsi)
+                    || networkIdForGroup(e.rawId);
+                return String(nid) === id;
             });
         } else {
             disabledNetworks.delete(id);
             disabledSources.delete('tetrapol');
         }
+        disabledNetworksLocalUntil = Date.now() + 4000;
+        saveDisabled();
+        syncDisabledNetworksToMixer();
         refreshAfterScopeChange();
+        updatePulseNetworkButtons();
+        lastPulseSig = '';
+        updatePulseAdmin();
+    }
+
+    function syncDisabledNetworksToMixer() {
+        const nets = [...disabledNetworks].map(String);
+        return apiTetrapolPulseExclusive({ disabled_networks: nets });
+    }
+
+    /** Boutons réseaux dans le panneau Pulse (admin) — visibles sans « Activer l'audio ». */
+    function updatePulseNetworkButtons() {
+        const box = document.getElementById('pulseNetworkButtonsContainer');
+        const title = document.getElementById('pulseNetworkButtonsTitle');
+        const empty = document.getElementById('pulseNetworkButtonsEmpty');
+        if (!box) return;
+        rememberScopeFromLiveData();
+        const networkIds = new Set([
+            ...knownScopeNetworks.keys(),
+            ...Object.keys(networkLabels)
+        ]);
+        tetrapolChannels.forEach((c) => {
+            const nid = extractNetworkId(c.rfsi);
+            if (nid) networkIds.add(nid);
+        });
+        const networks = [...networkIds].sort(
+            (a, b) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0)
+        );
+        if (title) title.style.display = '';
+        if (!networks.length) {
+            if (empty) {
+                empty.style.display = '';
+                empty.textContent = 'Aucun réseau reçu (WS Tetrapol / labels NETWORKS)';
+            }
+            [...box.querySelectorAll('.pulse-btn')].forEach((b) => b.remove());
+            return;
+        }
+        if (empty) empty.style.display = 'none';
+        const wanted = new Set(networks);
+        networks.forEach((id) => {
+            const parentOn = isSourceEnabled('tetrapol');
+            const onAir = tetrapolChannels.some(
+                (c) => extractNetworkId(c.rfsi) === id && c.on_air
+            );
+            const label = knownScopeNetworks.get(id) || networkLabels[id] || `Réseau ${id}`;
+            syncPulseNetworkButton(box, id, {
+                label,
+                enabled: parentOn && isNetworkEnabled(id),
+                onAir,
+                title: parentOn
+                    ? `Réseau ${id} — coupe Icecast + Pulse`
+                    : 'Projet Tetrapol désactivé'
+            });
+        });
+        [...box.querySelectorAll('.pulse-btn')].forEach((btn) => {
+            if (!wanted.has(btn.dataset.scopeId)) btn.remove();
+        });
+    }
+
+    function syncPulseNetworkButton(container, id, opts) {
+        if (!container) return null;
+        let btn = container.querySelector('.pulse-btn[data-scope-id="' + esc(id) + '"]');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'pulse-btn';
+            btn.dataset.scopeId = id;
+            btn.dataset.scopeKind = 'network';
+            const span = document.createElement('span');
+            span.className = 'pulse-btn-label';
+            btn.appendChild(span);
+            btn.addEventListener('click', () => toggleNetworkMonitoring(id));
+            container.appendChild(btn);
+        }
+        const span = btn.querySelector('.pulse-btn-label');
+        if (span) span.textContent = opts.label;
+        btn.classList.toggle('enabled', !!opts.enabled);
+        btn.classList.toggle('on-air', !!opts.onAir);
+        btn.title = opts.title || opts.label;
+        return btn;
     }
 
     function updateAirbandButtons() {
@@ -4577,6 +4710,8 @@
         applyAirbandPulsePriorities(pulseExclusiveState);
         applyTetrapolPulsePriorities(tpPulseExclusiveState);
         if (!isAdminMode) return;
+        // Boutons réseaux Pulse : toujours (même si early-return fills/struct)
+        updatePulseNetworkButtons();
 
         const abState = pulseExclusiveState || {};
         const tpState = tpPulseExclusiveState || {};
@@ -5567,6 +5702,7 @@
         if (tp.pulse_exclusive) {
             tpPulseExclusiveState = tp.pulse_exclusive;
             applyTetrapolPulsePriorities(tp.pulse_exclusive);
+            applyDisabledNetworksFromServer(tp.pulse_exclusive.disabled_networks);
         }
         lastTpSig = '';
         lastReceptionSig = '';
@@ -5661,7 +5797,12 @@
             if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
             if (tetrapolWsUrl && el.networkButtonsTitle) el.networkButtonsTitle.style.display = '';
         }
-        if (msg.NETWORKS) applyNetworksPayload(msg.NETWORKS);
+        if (msg.NETWORKS) {
+            applyNetworksPayload(msg.NETWORKS);
+            updatePulseNetworkButtons();
+            lastScopeSig = '';
+            updateScopeButtons();
+        }
         return wasAirband;
     }
 
@@ -5692,6 +5833,7 @@
             } else {
                 tpPulseExclusiveState = remoteTp;
             }
+            applyDisabledNetworksFromServer(remoteTp.disabled_networks);
         }
     }
 
@@ -5931,13 +6073,14 @@
         if (msg.NETWORKS) {
             applyNetworksPayload(msg.NETWORKS);
             lastScopeSig = '';
+            updatePulseNetworkButtons();
         }
         updateScopeButtons();
         if (pulseChanged) {
             applyPulseExclusiveFromMsg(msg);
             if (listingChanged) refreshExclusiveSegmentEntries();
         }
-        if (pulseChanged || listingChanged) {
+        if (pulseChanged || listingChanged || msg.NETWORKS) {
             updatePulseAdmin();
             refreshMonitorConnectionStatus();
         } else if (msg.sources || msg.config) {
@@ -6071,6 +6214,25 @@
         }
     }
 
+    async function seedNetworksFromLabels() {
+        try {
+            const r = await fetch('/labels.json', { cache: 'no-store' });
+            if (!r.ok) return;
+            const data = await r.json();
+            if (!data || !data.NETWORKS) return;
+            const nets = Object.keys(data.NETWORKS).map((id) => ({
+                network_id: id,
+                network_label: data.NETWORKS[id]
+            }));
+            applyNetworksPayload({ networks: nets });
+            updatePulseNetworkButtons();
+            lastScopeSig = '';
+            updateScopeButtons();
+        } catch (e) {
+            console.warn('labels NETWORKS seed failed', e);
+        }
+    }
+
     async function loadConfig() {
         try {
             // Monitor-side public Icecast base (preferred) — then Airband config fallback.
@@ -6091,6 +6253,7 @@
             if (tetrapolWsUrl && el.tetrapolSection) el.tetrapolSection.style.display = 'block';
             const tpTitle = document.getElementById('tetrapolGroupButtonsTitle');
             if (tetrapolWsUrl && tpTitle) tpTitle.style.display = '';
+            await seedNetworksFromLabels();
         } catch (e) {
             console.warn('config fetch failed', e);
         }
@@ -6116,6 +6279,7 @@
         document.addEventListener('admin-panel-ready', () => {
             wirePulseAdminControls();
             wireAdminReloadControls();
+            updatePulseNetworkButtons();
         });
         window.addEventListener('hashchange', () => {
             checkAdminMode();
@@ -6125,6 +6289,7 @@
         refreshDebugMode();
         loadConfig().then(() => {
             updateTetrapolListing();
+            syncDisabledNetworksToMixer();
             loadIcecastLib(() => connectLocal());
         });
     });

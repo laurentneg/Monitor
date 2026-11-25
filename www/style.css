@@ -1604,12 +1604,12 @@ tr:hover {
     animation: pulse-glow-dim 1.5s infinite;
 }
 
-/* Groupe actuellement en lecture Pulse : taille normale + halo cyan + label LECTURE */
+/* Groupe actuellement en lecture Pulse : taille normale + halo cyan */
 .pulse-btn.enabled.pulse-active {
     z-index: 2;
     transform: none;
     font-size: 0.9em;
-    padding: 0.4em 0.8em;
+    padding: 0.4em 0.4em;
     min-width: 80px;
     border-width: 2px;
     border-color: #6df !important;
@@ -1640,17 +1640,6 @@ tr:hover {
 
 .pulse-btn.enabled.pulse-active .pulse-btn-label::before {
     content: "▶ ";
-}
-
-.pulse-btn.enabled.pulse-active::after {
-    content: "LECTURE";
-    display: block;
-    margin-top: 0.2em;
-    font-size: 0.62em;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    color: #e8ffff;
-    line-height: 1;
 }
 
 @keyframes pulse-glow-playing {
